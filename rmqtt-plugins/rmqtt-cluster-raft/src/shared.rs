@@ -1,4 +1,3 @@
-use std::sync::Arc;
 use std::time::Duration;
 
 use ahash::HashSet;
@@ -15,7 +14,7 @@ use rmqtt::{
     session::Session,
     shared::{DefaultShared, Entry, Shared},
     types::{
-        From, Id, IsAdmin, NodeId, NodeName, OfflineSession, Publish, Reason, SessionStatus, SubRelations,
+        From, Id, IsAdmin, NodeId, OfflineSession, Publish, Reason, SessionStatus, SubRelations,
         SubRelationsMap, SubsSearchParams, SubsSearchResult, Subscribe, SubscribeReturn,
         SubscriptionClientIds, To, Tx, Unsubscribe,
     },
@@ -27,7 +26,8 @@ use super::message::{
     get_client_node_id, Message as RaftMessage, MessageReply as RaftMessageReply, RaftGrpcMessage,
     RaftGrpcMessageReply,
 };
-use super::{ClusterRouter, HashMap};
+use super::nodes::ClusterNodeManager;
+use super::ClusterRouter;
 
 pub struct ClusterLockEntry {
     scx: ServerContext,
@@ -288,8 +288,7 @@ pub struct ClusterShared {
     forwards_exec: TaskExecQueue,
     inner: DefaultShared,
     router: ClusterRouter,
-    grpc_clients: GrpcClients,
-    node_names: Arc<HashMap<NodeId, NodeName>>,
+    nodes: ClusterNodeManager,
     pub(crate) message_type: MessageType,
     exec_queue_busy_limit: isize,
     exec_queue_workers_busy_limit: isize,
@@ -303,8 +302,7 @@ impl ClusterShared {
         scx: ServerContext,
         exec: TaskExecQueue,
         router: ClusterRouter,
-        grpc_clients: GrpcClients,
-        node_names: HashMap<NodeId, NodeName>,
+        nodes: ClusterNodeManager,
         message_type: MessageType,
         exec_queue_max: usize,
         exec_queue_workers: usize,
@@ -318,8 +316,7 @@ impl ClusterShared {
             forwards_exec,
             inner: DefaultShared::new(Some(scx1)),
             router,
-            grpc_clients,
-            node_names: Arc::new(node_names),
+            nodes,
             message_type,
             exec_queue_busy_limit: (exec_queue_max as f64 * 0.7) as isize,
             exec_queue_workers_busy_limit: (exec_queue_workers as f64 * 0.9) as isize,
@@ -334,7 +331,90 @@ impl ClusterShared {
 
     #[inline]
     pub(crate) fn grpc_client(&self, node_id: u64) -> Option<GrpcClient> {
-        self.grpc_clients.get(&node_id).map(|(_, c)| c.clone())
+        self.nodes.grpc_client(node_id)
+    }
+
+    /// A route selected immediately before a session takeover may still point
+    /// at the previous node after the client ownership has moved. Keep this
+    /// recovery entirely off the normal delivery path: it is only attempted
+    /// after local delivery has already failed, and only by the node encoded
+    /// in the stale route.
+    async fn reroute_stale_local_delivery(
+        &self,
+        dropped: (To, From, Publish, Reason),
+    ) -> std::result::Result<(), (To, From, Publish, Reason)> {
+        let (to, from, publish, reason) = dropped;
+        let this_node_id = self.scx.node.id();
+        if to.node_id != this_node_id {
+            return Err((to, from, publish, reason));
+        }
+
+        let Some(target_node_id) = self.router.get_target_node_id(&to.client_id) else {
+            return Err((to, from, publish, reason));
+        };
+        if target_node_id == this_node_id {
+            return Err((to, from, publish, reason));
+        }
+        let Some(mut client) = self.grpc_client(target_node_id) else {
+            return Err((to, from, publish, reason));
+        };
+
+        let mut opts = SubscriptionOptions::default();
+        opts.set_qos(publish.qos);
+        let relations = vec![(publish.topic.clone(), to.client_id.clone(), opts, None, None)];
+        let deadline = tokio::time::Instant::now() + self.rw_timeout.min(Duration::from_secs(5));
+        loop {
+            match client
+                .send_message(
+                    self.message_type,
+                    Message::ForwardsTo(from.clone(), publish.clone(), relations.clone()),
+                    Some(self.rw_timeout),
+                )
+                .await
+            {
+                Ok(MessageReply::Success) => {
+                    log::debug!(
+                        "rerouted stale local delivery for client {} from node {} to current owner {}",
+                        to.client_id,
+                        this_node_id,
+                        target_node_id
+                    );
+                    return Ok(());
+                }
+                Ok(MessageReply::Error(e)) if tokio::time::Instant::now() < deadline => {
+                    log::debug!(
+                        "current owner {} is not ready for rerouted client {} yet: {}; retrying",
+                        target_node_id,
+                        to.client_id,
+                        e
+                    );
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Ok(reply) => {
+                    log::warn!(
+                        "reroute stale local delivery rejected for client {}, from node {} to current owner {}: {:?}",
+                        to.client_id,
+                        this_node_id,
+                        target_node_id,
+                        reply
+                    );
+                    return Err((to, from, publish, reason));
+                }
+                Err(e) => {
+                    // A transport error can be ambiguous: the target may have
+                    // accepted the message before the reply was lost. Avoid
+                    // retrying it here because that could create a duplicate.
+                    log::warn!(
+                        "reroute stale local delivery failed for client {}, from node {} to current owner {}: {:?}",
+                        to.client_id,
+                        this_node_id,
+                        target_node_id,
+                        e
+                    );
+                    return Err((to, from, publish, reason));
+                }
+            }
+        }
     }
 
     #[inline]
@@ -372,11 +452,20 @@ impl ClusterShared {
                 self.scx.stats.forwards.inc();
                 let scx = self.scx.clone();
                 let forwards_fut = async move {
-                    if let Err(e) = msg_sender.await {
-                        log::warn!(
-                            "forwards Message::ForwardsTo to other node, to: {target_nodeid:?}, error: {e:?}"
-                        );
-                        //@TODO messasge dropped
+                    match msg_sender.await {
+                        Ok(MessageReply::Success) => {}
+                        Ok(reply) => {
+                            log::warn!(
+                                "forwards Message::ForwardsTo to other node was rejected, to: {target_nodeid:?}, reply: {reply:?}"
+                            );
+                            //@TODO messasge dropped
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "forwards Message::ForwardsTo to other node, to: {target_nodeid:?}, error: {e:?}"
+                            );
+                            //@TODO messasge dropped
+                        }
                     }
                     scx.stats.forwards.dec();
                 };
@@ -451,11 +540,20 @@ impl ClusterShared {
                 let forwards_fut = async move {
                     let replys = futures::future::join_all(fut_senders).await;
                     for (node_id, reply) in replys {
-                        if let Err(e) = reply {
-                            log::warn!(
-                                "forwards Message::ForwardsTo to other node, from: {from:?}, to: {node_id:?}, error: {e:?}"
-                            );
-                            //@TODO messasge dropped
+                        match reply {
+                            Ok(MessageReply::Success) => {}
+                            Ok(reply) => {
+                                log::warn!(
+                                    "forwards Message::ForwardsTo to other node was rejected, from: {from:?}, to: {node_id:?}, reply: {reply:?}"
+                                );
+                                //@TODO messasge dropped
+                            }
+                            Err(e) => {
+                                log::warn!(
+                                    "forwards Message::ForwardsTo to other node, from: {from:?}, to: {node_id:?}, error: {e:?}"
+                                );
+                                //@TODO messasge dropped
+                            }
                         }
                     }
                     scx.stats.forwards.dec();
@@ -511,7 +609,22 @@ impl Shared for ClusterShared {
         publish: &Publish,
         relations: SubRelations,
     ) -> std::result::Result<(), Vec<(To, From, Publish, Reason)>> {
-        self.inner.forwards_to(from, publish, relations).await
+        match self.inner.forwards_to(from, publish, relations).await {
+            Ok(()) => Ok(()),
+            Err(droppeds) => {
+                let mut remaining = Vec::new();
+                for dropped in droppeds {
+                    if let Err(dropped) = self.reroute_stale_local_delivery(dropped).await {
+                        remaining.push(dropped);
+                    }
+                }
+                if remaining.is_empty() {
+                    Ok(())
+                } else {
+                    Err(remaining)
+                }
+            }
+        }
     }
 
     #[inline]
@@ -574,12 +687,12 @@ impl Shared for ClusterShared {
     }
     #[inline]
     fn get_grpc_clients(&self) -> GrpcClients {
-        self.grpc_clients.clone()
+        self.nodes.grpc_clients()
     }
 
     #[inline]
     fn node_name(&self, id: NodeId) -> String {
-        self.node_names.get(&id).cloned().unwrap_or_default()
+        self.nodes.node_name(id)
     }
 
     #[inline]
@@ -597,7 +710,7 @@ impl Shared for ClusterShared {
 
         let data = RaftGrpcMessage::GetNodeHealthStatus.encode()?;
         let replys = MessageBroadcaster::new(
-            self.grpc_clients.clone(),
+            self.nodes.grpc_clients(),
             self.message_type,
             Message::Data(data),
             Some(Duration::from_secs(5)),

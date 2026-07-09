@@ -1,6 +1,7 @@
 #![deny(unsafe_code)]
 
 use std::net::{SocketAddr, ToSocketAddrs};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -11,16 +12,18 @@ use config::PluginConfig;
 use handler::HookHandler;
 use rust_box::task_exec_queue::TaskExecQueue;
 use serde_json::{self, json};
+use tokio::sync::oneshot;
 use tokio::time::sleep;
 
+use nodes::ClusterNodeManager;
 use rmqtt::{
     context::ServerContext,
-    grpc::GrpcClients,
     hook::{Register, Type},
     macros::Plugin,
     plugin::{PackageInfo, Plugin},
     register,
-    types::{From, NodeId, Publish, Reason, To},
+    shared::Shared as _,
+    types::{From, Message as SessionMessage, NodeId, Publish, Reason, To},
     Result,
 };
 use rmqtt_raft::{Mailbox, Raft};
@@ -30,6 +33,8 @@ use shared::ClusterShared;
 mod config;
 mod handler;
 mod message;
+mod nodes;
+mod raft_admin;
 mod router;
 mod shared;
 
@@ -42,10 +47,11 @@ struct ClusterPlugin {
     scx: ServerContext,
     register: Box<dyn Register>,
     cfg: Arc<PluginConfig>,
-    grpc_clients: GrpcClients,
+    nodes: ClusterNodeManager,
     shared: ClusterShared,
     router: ClusterRouter,
     raft_mailbox: Option<Mailbox>,
+    draining: Arc<AtomicBool>,
     exec: TaskExecQueue,
     backoff_strategy: ExponentialBackoff,
 }
@@ -62,54 +68,33 @@ impl ClusterPlugin {
         let exec = scx.get_exec(("RAFT_EXEC", cfg.task_exec_queue_workers, cfg.task_exec_queue_max));
 
         let register = scx.extends.hook_mgr().register();
-        let mut grpc_clients = HashMap::default();
-        let mut node_names = HashMap::default();
-
-        let node_grpc_addrs = cfg.node_grpc_addrs.clone();
-        log::info!("node_grpc_addrs: {node_grpc_addrs:?}");
-        for node_addr in &node_grpc_addrs {
-            if node_addr.id != scx.node.id() {
-                let batch_size = cfg.node_grpc_batch_size;
-                let client_concurrency_limit = cfg.node_grpc_client_concurrency_limit;
-                let client_timeout = cfg.node_grpc_client_timeout;
-                grpc_clients.insert(
-                    node_addr.id,
-                    (
-                        node_addr.addr.clone(),
-                        scx.node
-                            .new_grpc_client(
-                                &node_addr.addr,
-                                client_timeout,
-                                client_concurrency_limit,
-                                batch_size,
-                            )
-                            .await?,
-                    ),
-                );
-            }
-            node_names.insert(node_addr.id, format!("{}@{}", node_addr.id, node_addr.addr));
-        }
-        let grpc_clients = Arc::new(grpc_clients);
+        let nodes = ClusterNodeManager::new(scx.clone(), &cfg);
+        nodes.seed_from_config(&cfg.node_grpc_addrs, &cfg.raft_peer_addrs).await?;
         let backoff_strategy = ExponentialBackoffBuilder::new()
             .with_max_elapsed_time(Some(Duration::from_secs(60)))
             .with_multiplier(2.5)
             .build();
-        let router =
-            ClusterRouter::new(scx.clone(), backoff_strategy.clone(), cfg.try_lock_timeout, cfg.compression);
+        let router = ClusterRouter::new(
+            scx.clone(),
+            backoff_strategy.clone(),
+            nodes.clone(),
+            cfg.try_lock_timeout,
+            cfg.compression,
+        );
         let shared = ClusterShared::new(
             scx.clone(),
             exec.clone(),
             router.clone(),
-            grpc_clients.clone(),
-            node_names,
+            nodes.clone(),
             cfg.message_type,
             cfg.task_exec_queue_max,
             cfg.task_exec_queue_workers,
             cfg.node_grpc_client_timeout,
         );
         let raft_mailbox = None;
+        let draining = Arc::new(AtomicBool::new(false));
         let cfg = Arc::new(cfg);
-        Ok(Self { scx, register, cfg, grpc_clients, shared, router, raft_mailbox, exec, backoff_strategy })
+        Ok(Self { scx, register, cfg, nodes, shared, router, raft_mailbox, draining, exec, backoff_strategy })
     }
 
     //raft init ...
@@ -157,36 +142,72 @@ impl ClusterPlugin {
         }
         log::info!("peer_addrs: {peer_addrs:?}");
 
-        let leader_info = match cfg.leader()? {
-            Some(leader_info) => {
-                log::info!("Specify a leader: {leader_info:?}");
-                if id == leader_info.id {
-                    //First, check if the Leader exists.
-                    let actual_leader_info = find_actual_leader(&raft, peer_addrs, 3).await?;
-                    if actual_leader_info.is_some() {
-                        log::info!("Leader already exists, {actual_leader_info:?}");
-                    }
-                    actual_leader_info
-                } else {
-                    //The other nodes are leader.
-                    let actual_leader_info = find_actual_leader(&raft, peer_addrs, 60).await?;
-                    let (actual_leader_id, actual_leader_addr) =
-                        actual_leader_info.ok_or_else(|| anyhow!("Leader does not exist"))?;
-                    if actual_leader_id != leader_info.id {
-                        return Err(anyhow!(format!(
-                            "Not the expected Leader, the expected one is {:?}",
-                            leader_info
-                        )));
-                    }
-                    Some((actual_leader_id, actual_leader_addr))
+        let leader_info = match cfg.bootstrap {
+            Some(true) => {
+                let bootstrap_node = cfg
+                    .leader()?
+                    .ok_or_else(|| anyhow!("controlled bootstrap requires a non-zero leader_id"))?;
+                if id != bootstrap_node.id {
+                    return Err(anyhow!(
+                        "node {id} is not the configured bootstrap node {}; refusing to create a new raft cluster",
+                        bootstrap_node.id
+                    ));
                 }
+
+                // An explicitly authorized bootstrap node still checks for an
+                // already-running leader before creating a new cluster. The
+                // operator only enables this mode while the StatefulSet has a
+                // single initial pod.
+                let actual_leader_info = find_actual_leader_retry(&raft, peer_addrs, 3).await?;
+                if actual_leader_info.is_some() {
+                    log::info!("Leader already exists, {actual_leader_info:?}");
+                } else {
+                    log::info!("No existing leader found; controlled bootstrap is enabled for node {id}");
+                }
+                actual_leader_info
             }
-            None => {
-                log::info!("Search for the existing leader ... ");
-                let leader_info = raft.find_leader_info(peer_addrs).await.map_err(|e| anyhow!(e))?;
-                log::info!("The information about the located leader: {leader_info:?}");
-                leader_info
+            Some(false) => {
+                // Existing-cluster mode is deliberately fail-closed: DNS,
+                // networking, and leader discovery failures must never be
+                // interpreted as permission to create another raft cluster.
+                log::info!("Controlled bootstrap is disabled; waiting for an existing leader ...");
+                let actual_leader_info = find_actual_leader_retry(&raft, peer_addrs, 60).await?;
+                Some(
+                    actual_leader_info
+                        .ok_or_else(|| anyhow!("Leader does not exist; controlled bootstrap is disabled"))?,
+                )
             }
+            None => match cfg.leader()? {
+                Some(leader_info) => {
+                    log::info!("Specify a leader: {leader_info:?}");
+                    if id == leader_info.id {
+                        //First, check if the Leader exists.
+                        let actual_leader_info = find_actual_leader(&raft, peer_addrs, 3).await?;
+                        if actual_leader_info.is_some() {
+                            log::info!("Leader already exists, {actual_leader_info:?}");
+                        }
+                        actual_leader_info
+                    } else {
+                        //The other nodes are leader.
+                        let actual_leader_info = find_actual_leader(&raft, peer_addrs, 60).await?;
+                        let (actual_leader_id, actual_leader_addr) =
+                            actual_leader_info.ok_or_else(|| anyhow!("Leader does not exist"))?;
+                        if actual_leader_id != leader_info.id {
+                            return Err(anyhow!(format!(
+                                "Not the expected Leader, the expected one is {:?}",
+                                leader_info
+                            )));
+                        }
+                        Some((actual_leader_id, actual_leader_addr))
+                    }
+                }
+                None => {
+                    log::info!("Search for the existing leader ... ");
+                    let leader_info = raft.find_leader_info(peer_addrs).await.map_err(|e| anyhow!(e))?;
+                    log::info!("The information about the located leader: {leader_info:?}");
+                    leader_info
+                }
+            },
         };
 
         //let (status_tx, status_rx) = futures::channel::oneshot::channel::<Result<Status>>();
@@ -204,9 +225,20 @@ impl ClusterPlugin {
                 let raft_handle = match leader_info {
                     Some((leader_id, leader_addr)) => {
                         log::info!(
-                            "running in follower mode, leader_id: {leader_id}, leader_addr: {leader_addr}"
+                            "running in follower mode, leader_id: {leader_id}, leader_addr: {leader_addr}, join_as_learner: {}",
+                            cfg.join_as_learner
                         );
-                        tokio::spawn(raft.join(id, raft_node_addr, Some(leader_id), leader_addr)).await
+                        if cfg.join_as_learner {
+                            tokio::spawn(raft.join_as_learner(
+                                id,
+                                raft_node_addr,
+                                Some(leader_id),
+                                leader_addr,
+                            ))
+                            .await
+                        } else {
+                            tokio::spawn(raft.join(id, raft_node_addr, Some(leader_id), leader_addr)).await
+                        }
                     }
                     None => {
                         log::info!("running in leader mode");
@@ -349,11 +381,32 @@ impl Plugin for ClusterPlugin {
         }
 
         let ping = message::Message::Ping.encode()?;
-        for _ in 0..100 {
+        let mut attempts = 0usize;
+        loop {
+            attempts += 1;
+            let status = raft_mailbox.status().await.map_err(anyhow::Error::new)?;
+            if !status.local_caught_up() || !status.is_voter(status.id) {
+                log::info!(
+                    "waiting for local raft catch-up before business NodeUp: id={}, snapshot_restored={}, applied={}, committed={}, voters={:?}, learners={:?}",
+                    status.id,
+                    status.snapshot_restored,
+                    status.applied_index,
+                    status.committed_index,
+                    status.voters,
+                    status.learners
+                );
+                sleep(Duration::from_millis(500)).await;
+                continue;
+            }
             match raft_mailbox.send_proposal(ping.clone()).await {
                 Ok(reply) => match message::MessageReply::decode(&reply)? {
                     message::MessageReply::Ping => {
                         log::info!("ping ok");
+                        let local_node = self
+                            .nodes
+                            .local_node_from_config(&self.cfg.node_grpc_addrs, &self.cfg.raft_peer_addrs)?;
+                        let node_up = message::Message::NodeUp { node: local_node }.encode()?;
+                        raft_mailbox.send_proposal(node_up).await.map_err(anyhow::Error::new)?;
                         return Ok(());
                     }
                     message::MessageReply::Error(e) => {
@@ -366,6 +419,9 @@ impl Plugin for ClusterPlugin {
                 Err(e) => {
                     log::warn!("ping failed, {e:?}");
                 }
+            }
+            if !self.cfg.join_as_learner && attempts >= 100 {
+                break;
             }
             sleep(Duration::from_millis(500)).await;
         }
@@ -394,7 +450,8 @@ impl Plugin for ClusterPlugin {
         }
 
         let mut nodes = HashMap::default();
-        for (node_id, (_, c)) in self.grpc_clients.iter() {
+        let grpc_clients = self.nodes.grpc_clients();
+        for (node_id, (_, c)) in grpc_clients.iter() {
             let stats = json!({
                 "transfer_queue_len": c.transfer_queue_len(),
                 "active_tasks_count": c.active_tasks().count(),
@@ -405,6 +462,7 @@ impl Plugin for ClusterPlugin {
 
         json!({
             "grpc_clients": nodes,
+            "cluster_nodes": self.nodes.to_json(),
             "raft_status": raft_status,
             "raft_pears": pears,
             "client_states": self.router.states_count(),
@@ -414,6 +472,432 @@ impl Plugin for ClusterPlugin {
                 "completed_count": self.exec.completed_count().await,
             }
         })
+    }
+
+    #[inline]
+    async fn send(&self, msg: serde_json::Value) -> Result<serde_json::Value> {
+        let action = msg.get("action").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("missing action"))?;
+        let raft_mailbox = self.raft_mailbox();
+        match action {
+            "node_up" => {
+                let node: message::ClusterNode =
+                    serde_json::from_value(msg.get("node").cloned().unwrap_or_else(|| {
+                        json!({
+                            "id": msg.get("id").cloned().unwrap_or_default(),
+                            "grpc_addr": msg.get("grpc_addr").cloned().unwrap_or_default(),
+                            "raft_addr": msg.get("raft_addr").cloned().unwrap_or_default(),
+                        })
+                    }))?;
+                let proposal = message::Message::NodeUp { node }.encode()?;
+                raft_mailbox.send_proposal(proposal).await.map_err(anyhow::Error::new)?;
+                Ok(json!({"ok": true}))
+            }
+            "node_down" => {
+                let id = msg.get("id").and_then(|v| v.as_u64()).ok_or_else(|| anyhow!("missing id"))?;
+                let proposal = message::Message::NodeDown { id }.encode()?;
+                raft_mailbox.send_proposal(proposal).await.map_err(anyhow::Error::new)?;
+                Ok(json!({"ok": true, "id": id, "raft_membership_changed": false}))
+            }
+            "node_remove" => {
+                let id = msg.get("id").and_then(|v| v.as_u64()).unwrap_or_else(|| self.scx.node.id());
+                if id != self.scx.node.id() {
+                    return Err(anyhow!(
+                        "node_remove must be sent to target node {id}; \
+                         use action=force_node_remove for business-only cleanup of an unreachable node"
+                    ));
+                }
+                self.leave_cluster(&raft_mailbox).await
+            }
+            "force_node_remove" => {
+                let id = msg.get("id").and_then(|v| v.as_u64()).ok_or_else(|| anyhow!("missing id"))?;
+                if id == self.scx.node.id() {
+                    return Err(anyhow!("force_node_remove cannot remove the local node; use action=leave"));
+                }
+                let proposal = message::Message::NodeRemove { id }.encode()?;
+                raft_mailbox.send_proposal(proposal).await.map_err(anyhow::Error::new)?;
+                Ok(json!({"ok": true, "id": id, "raft_membership_changed": false}))
+            }
+            "drain" | "node_drain" => self.drain_node(&raft_mailbox).await,
+            "undrain" | "resume" | "node_up_local" => self.undrain_node(&raft_mailbox).await,
+            "drain_status" => Ok(self.drain_status(&raft_mailbox).await),
+            "routing_status" => {
+                let id = msg.get("id").and_then(|v| v.as_u64()).unwrap_or_else(|| self.scx.node.id());
+                Ok(self.routing_status(id))
+            }
+            "leave" | "node_leave" => self.leave_cluster(&raft_mailbox).await,
+            "promote_learner" => {
+                let id = msg.get("id").and_then(|v| v.as_u64()).ok_or_else(|| anyhow!("missing id"))?;
+                let status = raft_mailbox.status().await.map_err(anyhow::Error::new)?;
+                if !status.is_leader() {
+                    return Err(anyhow!("promote_learner must be sent to the current raft leader"));
+                }
+                if !status.is_learner(id) {
+                    return Err(anyhow!("node {id} is not a learner"));
+                }
+                if !status.peer_caught_up(id) {
+                    return Err(anyhow!(
+                        "learner {id} has not caught up to leader commit {}",
+                        status.committed_index
+                    ));
+                }
+                let addr = status
+                    .peers
+                    .get(&id)
+                    .and_then(|peer| peer.as_ref())
+                    .map(|peer| peer.addr.to_string())
+                    .ok_or_else(|| anyhow!("raft address for node {id} was not configured"))?;
+                raft_mailbox.promote_learner(id, addr).await.map_err(anyhow::Error::new)?;
+                Ok(json!({"ok": true, "id": id, "action": "promote_learner"}))
+            }
+            "transfer_leader" => {
+                let id = msg.get("id").and_then(|v| v.as_u64()).ok_or_else(|| anyhow!("missing id"))?;
+                let status = raft_mailbox.status().await.map_err(anyhow::Error::new)?;
+                if !status.is_leader() {
+                    return Err(anyhow!("transfer_leader must be sent to the current raft leader"));
+                }
+                if !status.is_voter(id) || !status.peer_caught_up(id) {
+                    return Err(anyhow!("leadership target {id} is not a caught-up voter"));
+                }
+                raft_mailbox.transfer_leader(id).await.map_err(anyhow::Error::new)?;
+                Ok(json!({"ok": true, "id": id, "action": "transfer_leader"}))
+            }
+            "remove_voter" => {
+                let id = msg.get("id").and_then(|v| v.as_u64()).ok_or_else(|| anyhow!("missing id"))?;
+                let status = raft_mailbox.status().await.map_err(anyhow::Error::new)?;
+                if !status.is_leader() {
+                    return Err(anyhow!("remove_voter must be sent to the current raft leader"));
+                }
+                raft_mailbox.remove_node(id).await.map_err(anyhow::Error::new)?;
+                Ok(json!({"ok": true, "id": id, "action": "remove_voter"}))
+            }
+            "nodes" => Ok(self.nodes.to_json()),
+            "membership" | "raft_status" => Ok(self.membership_status(&raft_mailbox).await),
+            other => Err(anyhow!("unknown action: {other}")),
+        }
+    }
+}
+
+impl ClusterPlugin {
+    async fn membership_status(&self, raft_mailbox: &Mailbox) -> serde_json::Value {
+        let raft_status = raft_mailbox.status().await.ok();
+        let mut raft_peers = raft_status
+            .as_ref()
+            .map(|status| {
+                status
+                    .peers
+                    .iter()
+                    .map(|(id, peer)| {
+                        json!({
+                            "id": id,
+                            "addr": peer.as_ref().map(|p| p.addr.to_string()),
+                            "available": peer.as_ref().map(|p| p.available).unwrap_or(false),
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        raft_peers.sort_by_key(|peer| peer.get("id").and_then(|id| id.as_u64()).unwrap_or_default());
+
+        if let Some(status) = raft_status.as_ref() {
+            for peer in &mut raft_peers {
+                let Some(id) = peer.get("id").and_then(|id| id.as_u64()) else {
+                    continue;
+                };
+                if let Some(progress) = status.peer_replication.get(&id) {
+                    peer["matchedIndex"] = json!(progress.matched);
+                    peer["nextIndex"] = json!(progress.next_index);
+                    peer["committedIndex"] = json!(progress.committed_index);
+                    peer["pendingSnapshot"] = json!(progress.pending_snapshot);
+                    peer["recentActive"] = json!(progress.recent_active);
+                    peer["progressState"] = json!(progress.state.clone());
+                }
+            }
+        }
+        let business_peers = self.nodes.to_json();
+
+        json!({
+            "id": self.scx.node.id(),
+            "leaderId": raft_status.as_ref().map(|status| status.leader_id),
+            "isLeader": raft_status.as_ref().map(|status| status.is_leader()).unwrap_or(false),
+            "available": raft_status.as_ref().map(|status| status.available()).unwrap_or(false),
+            "started": raft_status.as_ref().map(|status| status.is_started()).unwrap_or(false),
+            "caughtUp": raft_status.as_ref().map(|status| status.local_caught_up()).unwrap_or(false),
+            "snapshotRestored": raft_status.as_ref().map(|status| status.snapshot_restored).unwrap_or(false),
+            "snapshotIndex": raft_status.as_ref().map(|status| status.snapshot_index).unwrap_or_default(),
+            "appliedIndex": raft_status.as_ref().map(|status| status.applied_index).unwrap_or_default(),
+            "committedIndex": raft_status.as_ref().map(|status| status.committed_index).unwrap_or_default(),
+            "lastIndex": raft_status.as_ref().map(|status| status.last_index).unwrap_or_default(),
+            "draining": self.draining.load(Ordering::SeqCst),
+            "role": raft_status.as_ref().map(|status| format!("{:?}", status.role)),
+            "uncommitteds": raft_status.as_ref().map(|status| status.uncommitteds).unwrap_or_default(),
+            "mergerProposals": raft_status.as_ref().map(|status| status.merger_proposals).unwrap_or_default(),
+            "voters": raft_status.as_ref().map(|status| status.voters.clone()).unwrap_or_default(),
+            "learners": raft_status.as_ref().map(|status| status.learners.clone()).unwrap_or_default(),
+            "raftPeers": raft_peers,
+            "businessPeers": business_peers,
+            "supports": {
+                "addLearner": true,
+                "promoteLearner": true,
+                "transferLeader": true,
+                "removeNodeFromLeader": true,
+                "directAddVoter": true,
+                "selfLeave": true
+            }
+        })
+    }
+
+    async fn drain_node(&self, _raft_mailbox: &Mailbox) -> Result<serde_json::Value> {
+        let id = self.scx.node.id();
+        let start_disconnects = !self.draining.swap(true, Ordering::SeqCst);
+        let disconnect_requested = self.scx.stats.connections.count();
+        if start_disconnects {
+            let shared = self.shared.clone();
+            let draining = self.draining.clone();
+            tokio::spawn(async move {
+                while draining.load(Ordering::SeqCst) {
+                    let entries = shared.inner().iter().collect::<Vec<_>>();
+                    let mut requested = 0usize;
+                    for entry in entries {
+                        let Some(tx) = entry.tx().filter(|tx| !tx.is_closed()) else {
+                            continue;
+                        };
+                        let client_id = entry.id();
+                        let (ack_tx, ack_rx) = oneshot::channel();
+                        match tx.unbounded_send(SessionMessage::Drain(ack_tx, client_id.clone())) {
+                            Ok(()) => {
+                                requested += 1;
+                                tokio::spawn(async move {
+                                    if tokio::time::timeout(Duration::from_secs(5), ack_rx).await.is_err() {
+                                        log::warn!(
+                                            "drain offline transition acknowledgement timed out for {client_id:?}"
+                                        );
+                                    }
+                                });
+                            }
+                            Err(e) => {
+                                log::warn!("drain failed to request disconnect for {client_id:?}: {e:?}");
+                            }
+                        }
+                    }
+                    if requested > 0 {
+                        log::info!("drain requested reconnect for {requested} local MQTT sessions");
+                    }
+                    sleep(Duration::from_secs(1)).await;
+                }
+            });
+        }
+        Ok(json!({
+            "ok": true,
+            "id": id,
+            "draining": true,
+            "disconnectWorkerStarted": start_disconnects,
+            "disconnectRequested": disconnect_requested,
+            "raft_membership_changed": false,
+            "note": "external traffic is disabled and connections enter the offline session loop; business routing, offline queues and session handoff remain active until drain_status.safe_to_leave"
+        }))
+    }
+
+    async fn undrain_node(&self, raft_mailbox: &Mailbox) -> Result<serde_json::Value> {
+        let node = self.nodes.local_node_from_config(&self.cfg.node_grpc_addrs, &self.cfg.raft_peer_addrs)?;
+        let id = node.id;
+        let proposal = message::Message::NodeUp { node }.encode()?;
+        raft_mailbox.send_proposal(proposal).await.map_err(anyhow::Error::new)?;
+        self.draining.store(false, Ordering::SeqCst);
+        Ok(json!({
+            "ok": true,
+            "id": id,
+            "draining": false,
+            "raft_membership_changed": false,
+        }))
+    }
+
+    async fn drain_status(&self, raft_mailbox: &Mailbox) -> serde_json::Value {
+        let stats = &self.scx.stats;
+        let id = self.scx.node.id();
+        let connections = self.scx.connections.count();
+        let sessions = self.scx.sessions.count();
+        let handshakings_active = self.scx.handshake_exec.active_count();
+        let client_states = self.router.node_states_count(id);
+        let routes = self.router.node_routes_count(id);
+        let message_queues = stats.message_queues.count();
+        let out_inflights = stats.out_inflights.count();
+        let in_inflights = stats.in_inflights.count();
+        let forwards = stats.forwards.count();
+        let message_mgr = self.scx.extends.message_mgr().await;
+        let message_storage_enabled = message_mgr.enable();
+        let message_storages =
+            if message_storage_enabled { message_mgr.count().await } else { stats.message_storages.count() };
+        let delayed_publishs = stats.delayed_publishs.count();
+        let message_safe_to_leave = connections == 0
+            && handshakings_active == 0
+            && message_queues == 0
+            && out_inflights == 0
+            && in_inflights == 0
+            && forwards == 0
+            && (!message_storage_enabled || message_storages == 0)
+            && delayed_publishs == 0;
+        let session_handoff_complete = sessions == 0 && client_states == 0 && routes == 0;
+        let strict_safe_to_leave = message_safe_to_leave && session_handoff_complete;
+        let raft_status = raft_mailbox.status().await.ok();
+        let blocking_counts = json!({
+            "connections": if connections > 0 { Some(connections) } else { None },
+            "sessions": if sessions > 0 { Some(sessions) } else { None },
+            "client_states": if client_states > 0 { Some(client_states) } else { None },
+            "routes": if routes > 0 { Some(routes) } else { None },
+            "handshakings_active": if handshakings_active > 0 { Some(handshakings_active) } else { None },
+            "message_queues": if message_queues > 0 { Some(message_queues) } else { None },
+            "out_inflights": if out_inflights > 0 { Some(out_inflights) } else { None },
+            "in_inflights": if in_inflights > 0 { Some(in_inflights) } else { None },
+            "forwards": if forwards > 0 { Some(forwards) } else { None },
+            "message_storages": if message_storage_enabled && message_storages > 0 { Some(message_storages) } else { None },
+            "delayed_publishs": if delayed_publishs > 0 { Some(delayed_publishs) } else { None },
+        });
+        let message_blocking_counts = json!({
+            "connections": if connections > 0 { Some(connections) } else { None },
+            "handshakings_active": if handshakings_active > 0 { Some(handshakings_active) } else { None },
+            "message_queues": if message_queues > 0 { Some(message_queues) } else { None },
+            "out_inflights": if out_inflights > 0 { Some(out_inflights) } else { None },
+            "in_inflights": if in_inflights > 0 { Some(in_inflights) } else { None },
+            "forwards": if forwards > 0 { Some(forwards) } else { None },
+            "message_storages": if message_storage_enabled && message_storages > 0 { Some(message_storages) } else { None },
+            "delayed_publishs": if delayed_publishs > 0 { Some(delayed_publishs) } else { None },
+        });
+        let blocking_reasons = blocking_counts
+            .as_object()
+            .map(|counts| {
+                counts
+                    .iter()
+                    .filter_map(|(name, value)| if value.is_null() { None } else { Some(name.as_str()) })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let message_blocking_reasons = message_blocking_counts
+            .as_object()
+            .map(|counts| {
+                counts
+                    .iter()
+                    .filter_map(|(name, value)| if value.is_null() { None } else { Some(name.as_str()) })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        json!({
+            "id": id,
+            "draining": self.draining.load(Ordering::SeqCst),
+            "safe_to_leave": strict_safe_to_leave,
+            "message_safe_to_leave": message_safe_to_leave,
+            "strict_safe_to_leave": strict_safe_to_leave,
+            "session_handoff_complete": session_handoff_complete,
+            "raft_membership_present": raft_status
+                .as_ref()
+                .map(|status| status.peers.contains_key(&self.scx.node.id()))
+                .unwrap_or(false),
+            "raft_leader_id": raft_status.as_ref().map(|status| status.leader_id),
+            "counts": {
+                "connections": connections,
+                "sessions": sessions,
+                "client_states": client_states,
+                "routes": routes,
+                "handshakings_active": handshakings_active,
+                "message_queues": message_queues,
+                "out_inflights": out_inflights,
+                "in_inflights": in_inflights,
+                "forwards": forwards,
+                "message_storages": message_storages,
+                "message_storage_enabled": message_storage_enabled,
+                "delayed_publishs": delayed_publishs,
+            },
+            "blocking_counts": blocking_counts,
+            "blocking_reasons": blocking_reasons,
+            "message_blocking_counts": message_blocking_counts,
+            "message_blocking_reasons": message_blocking_reasons,
+            "operator_next_step": if strict_safe_to_leave { "leave" } else { "wait" },
+            "note": "safe_to_leave requires MQTT session ownership and replicated routing state to move away from this node, then requires local message state to drain; it does not wait for session expiry",
+        })
+    }
+
+    fn routing_status(&self, target_id: NodeId) -> serde_json::Value {
+        let client_states = self.router.node_states_count(target_id);
+        let routes = self.router.node_routes_count(target_id);
+        let active_forwards = self.nodes.grpc_active_tasks(target_id);
+        json!({
+            "id": self.scx.node.id(),
+            "targetId": target_id,
+            "clientStates": client_states,
+            "routes": routes,
+            "activeForwards": active_forwards,
+            "converged": client_states == 0 && routes == 0 && active_forwards == 0,
+        })
+    }
+
+    async fn leave_cluster(&self, raft_mailbox: &Mailbox) -> Result<serde_json::Value> {
+        let id = self.scx.node.id();
+        if self.draining.load(Ordering::SeqCst)
+            && self
+                .drain_status(raft_mailbox)
+                .await
+                .get("strict_safe_to_leave")
+                .and_then(serde_json::Value::as_bool)
+                != Some(true)
+        {
+            return Err(anyhow!(
+                "node {id} still has active session, connection or message state; refusing raft leave"
+            ));
+        }
+        let local_node =
+            self.nodes.local_node_from_config(&self.cfg.node_grpc_addrs, &self.cfg.raft_peer_addrs)?;
+
+        let proposal = message::Message::NodeRemove { id }.encode()?;
+        raft_mailbox.send_proposal(proposal).await.map_err(anyhow::Error::new)?;
+
+        if let Err(e) = self.remove_self_from_raft(raft_mailbox).await {
+            let restore = message::Message::NodeUp { node: local_node }.encode()?;
+            if let Err(restore_err) = raft_mailbox.send_proposal(restore).await {
+                log::error!(
+                    "raft leave failed and failed to restore business node metadata, id: {id}, \
+                     leave_error: {e}, restore_error: {restore_err}"
+                );
+            }
+            return Err(e);
+        }
+
+        Ok(json!({"ok": true, "id": id, "raft_membership_changed": true}))
+    }
+
+    async fn remove_self_from_raft(&self, raft_mailbox: &Mailbox) -> Result<()> {
+        let status = raft_mailbox.status().await.map_err(anyhow::Error::new)?;
+        if status.is_leader() {
+            return raft_mailbox.leave().await.map_err(anyhow::Error::new);
+        }
+
+        let leader_id = status.leader_id;
+        let leader_addr = status
+            .peers
+            .get(&leader_id)
+            .and_then(|peer| peer.as_ref().map(|peer| peer.addr.to_string()))
+            .or_else(|| {
+                self.cfg
+                    .raft_peer_addrs
+                    .iter()
+                    .find(|peer| peer.id == leader_id)
+                    .map(|peer| peer.addr.to_string())
+            })
+            .ok_or_else(|| anyhow!("raft leader address not found, leader_id: {leader_id}"))?;
+
+        log::info!(
+            "request raft leader to remove local node, node_id: {}, leader_id: {}, leader_addr: {}",
+            self.scx.node.id(),
+            leader_id,
+            leader_addr
+        );
+        raft_admin::remove_node(
+            &leader_addr,
+            self.scx.node.id(),
+            self.cfg.raft.grpc_timeout.unwrap_or(Duration::from_secs(6)),
+            self.cfg.raft.grpc_concurrency_limit.unwrap_or(200),
+            self.cfg.raft.grpc_message_size.unwrap_or(50 * 1024 * 1024),
+        )
+        .await
     }
 }
 
@@ -449,6 +933,30 @@ async fn find_actual_leader(
             break;
         }
         log::info!("Leader not found, rounds: {i}");
+        sleep(Duration::from_millis(500)).await;
+    }
+    Ok(actual_leader_info)
+}
+
+async fn find_actual_leader_retry(
+    raft: &Raft<ClusterRouter>,
+    peer_addrs: Vec<String>,
+    rounds: usize,
+) -> Result<Option<(NodeId, String)>> {
+    if peer_addrs.is_empty() {
+        return Ok(None);
+    }
+
+    let mut actual_leader_info = None;
+    for i in 0..rounds {
+        match raft.find_leader_info(peer_addrs.clone()).await {
+            Ok(Some(leader_info)) => {
+                actual_leader_info = Some(leader_info);
+                break;
+            }
+            Ok(None) => log::info!("Leader not found, round: {i}"),
+            Err(e) => log::warn!("Leader discovery failed, round: {i}, error: {e}"),
+        }
         sleep(Duration::from_millis(500)).await;
     }
     Ok(actual_leader_info)

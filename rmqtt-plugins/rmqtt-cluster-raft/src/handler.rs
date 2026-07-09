@@ -132,9 +132,17 @@ impl Handler for HookHandler {
                         if let Err(droppeds) =
                             self.shared.forwards_to(from.clone(), publish, sub_rels.clone()).await
                         {
+                            let reason = droppeds
+                                .first()
+                                .map(|(_, _, _, reason)| reason.to_string())
+                                .unwrap_or_else(|| "local delivery failed".to_string());
                             hook_message_dropped(&self.scx, droppeds).await;
+                            return (
+                                false,
+                                Some(HookResult::GrpcMessageReply(Ok(MessageReply::Error(reason)))),
+                            );
                         }
-                        return (false, acc);
+                        return (false, Some(HookResult::GrpcMessageReply(Ok(MessageReply::Success))));
                     }
                     GrpcMessage::Kick(id, clean_start, clear_subscriptions, is_admin) => {
                         let mut entry = self.shared.inner().entry(id.clone());

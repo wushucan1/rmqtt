@@ -366,12 +366,39 @@ impl Entry for LockEntry {
             }
         }
 
-        if let Some((s, _)) = self._remove(clear_subscriptions).await {
+        if let Some((s, _)) = self._remove(clean_start && clear_subscriptions).await {
             if clean_start {
                 Ok(OfflineSession::Exist(None))
             } else {
                 match s.to_offline_info().await {
-                    Ok(offline_info) => Ok(OfflineSession::Exist(Some(offline_info))),
+                    Ok(offline_info) => {
+                        // A cross-node takeover must remove routes that still
+                        // reference the previous node, but the subscriptions
+                        // themselves are part of the session state being
+                        // transferred. Removing them before `to_offline_info`
+                        // made the transferred snapshot incomplete.
+                        if clear_subscriptions {
+                            for (topic_filter, _) in offline_info.subscriptions.iter() {
+                                if let Err(e) = self
+                                    .shared
+                                    .context()
+                                    .extends
+                                    .router()
+                                    .await
+                                    .remove(topic_filter, s.id.clone())
+                                    .await
+                                {
+                                    log::warn!(
+                                        "{:?} kick remove previous route, topic_filter: {}, {:?}",
+                                        self.id,
+                                        topic_filter,
+                                        e
+                                    );
+                                }
+                            }
+                        }
+                        Ok(OfflineSession::Exist(Some(offline_info)))
+                    }
                     Err(e) => {
                         log::error!("get offline info error, {e:?}");
                         Ok(OfflineSession::Exist(None))

@@ -1900,6 +1900,11 @@ pub enum Message {
     Forward(From, Publish),
     SendRerelease(OutInflightMessage),
     Kick(oneshot::Sender<()>, Id, CleanStart, IsAdmin),
+    /// Disconnect the network connection for a planned broker drain while
+    /// keeping the MQTT session alive in its offline event loop. Unlike
+    /// `Kick`, this preserves the local mailbox so messages selected through
+    /// a not-yet-converged route can still be queued until session takeover.
+    Drain(oneshot::Sender<()>, Id),
     // Disconnect(Disconnect),
     Closed(Reason),
     Subscribe(Subscribe, oneshot::Sender<Result<SubscribeReturn>>),
@@ -2315,6 +2320,7 @@ bitflags! {
         const DisconnectReceived = 0b00000100;
         const CleanStart = 0b00001000;
         const Ping = 0b00010000;
+        const Draining = 0b00100000;
     }
 }
 

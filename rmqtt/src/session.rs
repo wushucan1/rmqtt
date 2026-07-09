@@ -121,6 +121,11 @@ impl Deref for SessionState {
 
 impl SessionState {
     #[inline]
+    fn preserve_offline_session(flags: StateFlags, clean_session: bool) -> bool {
+        flags.contains(StateFlags::Draining) || !clean_session
+    }
+
+    #[inline]
     pub(crate) fn new(
         session: Session,
         hook: Arc<dyn Hook>,
@@ -268,7 +273,7 @@ impl SessionState {
                 self.clean(&deliver_queue_tx, self.disconnected_reason_take().await.unwrap_or_default())
                     .await;
             }
-        } else if clean_session {
+        } else if !Self::preserve_offline_session(flags, clean_session) {
             self.clean(&deliver_queue_tx, self.disconnected_reason_take().await.unwrap_or_default()).await;
         } else {
             let session_expiry_interval = self.fitter.session_expiry_interval(disconnect.as_ref());
@@ -447,6 +452,20 @@ impl SessionState {
                                     log::warn!("{:?} offline Kick sender is closed, to {:?}, clean_start: {}, is_admin: {}", self.id, by_id, clean_start, is_admin);
                                 }
                             },
+                            Message::Drain(sender, by_id) => {
+                                log::debug!(
+                                    "{:?} already offline for planned drain requested by {:?}",
+                                    self.id,
+                                    by_id
+                                );
+                                if !sender.is_closed() && sender.send(()).is_err() {
+                                    log::warn!(
+                                        "{:?} offline drain acknowledgement receiver is closed, requested by {:?}",
+                                        self.id,
+                                        by_id
+                                    );
+                                }
+                            },
                             _ => {
                                 log::debug!("{:?} offline receive message is {:?}", self.id, msg);
                             }
@@ -600,6 +619,18 @@ impl SessionState {
                         is_admin
                     );
                 }
+            }
+            Message::Drain(sender, by_id) => {
+                log::debug!(
+                    "{:?} Message::Drain, preserve offline session and disconnect network, requested by {:?}",
+                    self.id,
+                    by_id
+                );
+                if !sender.is_closed() && sender.send(()).is_err() {
+                    log::warn!("{:?} Message::Drain acknowledgement receiver is closed", self.id);
+                }
+                flags.insert(StateFlags::Draining);
+                return Err(Reason::ConnectRemoteClose);
             }
             Message::Subscribe(sub, reply_tx) => {
                 log::debug!("{:?} Message::Subscribe, sub {:?}", self.id, sub,);
@@ -822,7 +853,8 @@ impl SessionState {
     #[inline]
     fn last_will_enable(&self, flags: StateFlags, clean_session: bool) -> bool {
         let session_present =
-            flags.contains(StateFlags::Kicked) && !flags.contains(StateFlags::CleanStart) && !clean_session;
+            (flags.contains(StateFlags::Kicked) && !flags.contains(StateFlags::CleanStart) && !clean_session)
+                || flags.contains(StateFlags::Draining);
         !(flags.contains(StateFlags::DisconnectReceived) || session_present)
     }
 
@@ -1382,7 +1414,7 @@ impl SessionState {
     }
 
     #[inline]
-    async fn transfer_session_state(
+    pub(crate) async fn transfer_session_state(
         &self,
         clear_subscriptions: bool,
         mut offline_info: OfflineInfo,
@@ -1841,6 +1873,18 @@ impl SessionState {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod drain_tests {
+    use super::*;
+
+    #[test]
+    fn planned_drain_selects_the_offline_session_path() {
+        assert!(SessionState::preserve_offline_session(StateFlags::Draining, true));
+        assert!(SessionState::preserve_offline_session(StateFlags::empty(), false));
+        assert!(!SessionState::preserve_offline_session(StateFlags::empty(), true));
     }
 }
 
