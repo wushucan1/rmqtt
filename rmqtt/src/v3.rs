@@ -43,9 +43,11 @@ use crate::context::ServerContext;
 use crate::net::v3;
 use crate::net::MqttError;
 use crate::session::{Session, SessionState};
+#[cfg(feature = "auto-subscription")]
+use crate::types::Message;
 use crate::types::{
-    ClientId, ConnectAckReason, ConnectInfo, Id, ListenerConfig, ListenerId, Message, OfflineSession,
-    SessionSubs, Sink,
+    ClientId, ConnectAckReason, ConnectInfo, Id, ListenerConfig, ListenerId, OfflineSession, SessionSubs,
+    Sink,
 };
 use crate::utils::timestamp_millis;
 use crate::{Error, Result};
@@ -305,8 +307,8 @@ async fn _handshake(
 
     //transfer session state
     if let Some(o) = offline_info {
-        if let Err(e) = state.tx().unbounded_send(Message::SessionStateTransfer(o, clean_session)) {
-            return Err((ConnectAckReason::V3(ConnectAckReasonV3::ServiceUnavailable), e.into()));
+        if let Err(e) = state.transfer_session_state(clean_session, o).await {
+            return Err((ConnectAckReason::V3(ConnectAckReasonV3::ServiceUnavailable), e));
         }
     }
 

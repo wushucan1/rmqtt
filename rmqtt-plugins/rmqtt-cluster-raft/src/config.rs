@@ -44,6 +44,20 @@ pub struct PluginConfig {
     #[serde(default)]
     pub leader_id: NodeId,
 
+    /// Controls whether this process may initialize a brand-new single-node
+    /// raft cluster. `None` preserves the legacy auto-discovery behavior for
+    /// non-operator deployments, `Some(true)` explicitly allows bootstrap,
+    /// and `Some(false)` makes startup fail closed until an existing leader is
+    /// found.
+    #[serde(default)]
+    pub bootstrap: Option<bool>,
+
+    /// Join an existing cluster as a learner. Operator-managed deployments
+    /// enable this so a new pod cannot change quorum or receive business
+    /// traffic until it has restored and caught up.
+    #[serde(default)]
+    pub join_as_learner: bool,
+
     #[serde(default = "PluginConfig::try_lock_timeout_default", deserialize_with = "deserialize_duration")]
     pub try_lock_timeout: Duration, //Message::HandshakeTryLock
 
@@ -186,6 +200,8 @@ pub struct RaftConfig {
     pub grpc_reuseport: bool,
     #[serde(default, deserialize_with = "deserialize_duration_option")]
     pub grpc_timeout: Option<Duration>,
+    #[serde(default, deserialize_with = "deserialize_duration_option")]
+    pub join_connect_retry_timeout: Option<Duration>,
     pub grpc_concurrency_limit: Option<usize>,
     pub grpc_message_size: Option<usize>,
     pub grpc_breaker_threshold: Option<u64>,
@@ -278,6 +294,9 @@ impl RaftConfig {
         cfg.reuseport = self.grpc_reuseport;
         if let Some(grpc_timeout) = self.grpc_timeout {
             cfg.grpc_timeout = grpc_timeout;
+        }
+        if let Some(join_connect_retry_timeout) = self.join_connect_retry_timeout {
+            cfg.join_connect_retry_timeout = join_connect_retry_timeout;
         }
         if let Some(grpc_concurrency_limit) = self.grpc_concurrency_limit {
             cfg.grpc_concurrency_limit = grpc_concurrency_limit;
@@ -384,6 +403,25 @@ impl RaftConfig {
             ReadOnlyOption::LeaseBased => "leasebased",
         };
         rop_str.serialize(s)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn join_connect_retry_timeout_uses_rmqtt_raft_default() {
+        let cfg = RaftConfig::default().to_raft_config();
+        assert_eq!(cfg.join_connect_retry_timeout, Duration::from_secs(20));
+    }
+
+    #[test]
+    fn join_connect_retry_timeout_can_be_overridden() {
+        let cfg =
+            RaftConfig { join_connect_retry_timeout: Some(Duration::from_secs(7)), ..Default::default() }
+                .to_raft_config();
+        assert_eq!(cfg.join_connect_retry_timeout, Duration::from_secs(7));
     }
 }
 

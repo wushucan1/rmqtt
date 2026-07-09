@@ -121,6 +121,11 @@ impl Deref for SessionState {
 
 impl SessionState {
     #[inline]
+    fn preserve_offline_session(flags: StateFlags, clean_session: bool) -> bool {
+        flags.contains(StateFlags::Draining) || !clean_session
+    }
+
+    #[inline]
     pub(crate) fn new(
         session: Session,
         hook: Arc<dyn Hook>,
@@ -268,7 +273,7 @@ impl SessionState {
                 self.clean(&deliver_queue_tx, self.disconnected_reason_take().await.unwrap_or_default())
                     .await;
             }
-        } else if clean_session {
+        } else if !Self::preserve_offline_session(flags, clean_session) {
             self.clean(&deliver_queue_tx, self.disconnected_reason_take().await.unwrap_or_default()).await;
         } else {
             let session_expiry_interval = self.fitter.session_expiry_interval(disconnect.as_ref());
@@ -447,6 +452,20 @@ impl SessionState {
                                     log::warn!("{:?} offline Kick sender is closed, to {:?}, clean_start: {}, is_admin: {}", self.id, by_id, clean_start, is_admin);
                                 }
                             },
+                            Message::Drain(sender, by_id) => {
+                                log::debug!(
+                                    "{:?} already offline for planned drain requested by {:?}",
+                                    self.id,
+                                    by_id
+                                );
+                                if !sender.is_closed() && sender.send(()).is_err() {
+                                    log::warn!(
+                                        "{:?} offline drain acknowledgement receiver is closed, requested by {:?}",
+                                        self.id,
+                                        by_id
+                                    );
+                                }
+                            },
                             _ => {
                                 log::debug!("{:?} offline receive message is {:?}", self.id, msg);
                             }
@@ -600,6 +619,18 @@ impl SessionState {
                         is_admin
                     );
                 }
+            }
+            Message::Drain(sender, by_id) => {
+                log::debug!(
+                    "{:?} Message::Drain, preserve offline session and disconnect network, requested by {:?}",
+                    self.id,
+                    by_id
+                );
+                if !sender.is_closed() && sender.send(()).is_err() {
+                    log::warn!("{:?} Message::Drain acknowledgement receiver is closed", self.id);
+                }
+                flags.insert(StateFlags::Draining);
+                return Err(Reason::ConnectRemoteClose);
             }
             Message::Subscribe(sub, reply_tx) => {
                 log::debug!("{:?} Message::Subscribe, sub {:?}", self.id, sub,);
@@ -822,7 +853,8 @@ impl SessionState {
     #[inline]
     fn last_will_enable(&self, flags: StateFlags, clean_session: bool) -> bool {
         let session_present =
-            flags.contains(StateFlags::Kicked) && !flags.contains(StateFlags::CleanStart) && !clean_session;
+            (flags.contains(StateFlags::Kicked) && !flags.contains(StateFlags::CleanStart) && !clean_session)
+                || flags.contains(StateFlags::Draining);
         !(flags.contains(StateFlags::DisconnectReceived) || session_present)
     }
 
@@ -1382,7 +1414,7 @@ impl SessionState {
     }
 
     #[inline]
-    async fn transfer_session_state(
+    pub(crate) async fn transfer_session_state(
         &self,
         clear_subscriptions: bool,
         mut offline_info: OfflineInfo,
@@ -1844,6 +1876,18 @@ impl SessionState {
     }
 }
 
+#[cfg(test)]
+mod drain_tests {
+    use super::*;
+
+    #[test]
+    fn planned_drain_selects_the_offline_session_path() {
+        assert!(SessionState::preserve_offline_session(StateFlags::Draining, true));
+        assert!(SessionState::preserve_offline_session(StateFlags::empty(), false));
+        assert!(!SessionState::preserve_offline_session(StateFlags::empty(), true));
+    }
+}
+
 #[derive(Clone)]
 pub struct Session(Arc<_Session>);
 
@@ -1874,14 +1918,19 @@ impl Deref for _Session {
 
 impl Drop for _Session {
     fn drop(&mut self) {
-        // #[cfg(feature = "stats")]
-        self.scx.sessions.dec();
         let id = self.id.clone();
         let s = self.inner.clone();
+        let scx = self.scx.clone();
         tokio::spawn(async move {
             if let Err(e) = s.on_drop().await {
                 log::error!("{id:?} session clear error, {e:?}");
             }
+            // Keep the session visible to drain_status until the concrete
+            // session and its queue/inflight containers have completed their
+            // cleanup. Otherwise sessions=0 can be observed before queue Drop
+            // callbacks have corrected their gauges.
+            drop(s);
+            scx.sessions.dec();
         });
     }
 }
@@ -1939,17 +1988,35 @@ impl Session {
             });
         }
 
+        #[cfg(feature = "stats")]
+        {
+            let scx1 = scx.clone();
+            deliver_queue.on_drop(move |remaining| {
+                scx1.stats.message_queues.decs(remaining as isize);
+                scx1.stats.message_queue_drops.incs(remaining as isize);
+                log::error!("destroyed a session message queue with {remaining} undelivered messages");
+            });
+        }
+
         let out_inflight = OutInflight::new(max_inflight, message_retry_interval, message_expiry_interval);
         #[cfg(feature = "stats")]
         let out_inflight = {
             let scx1 = scx.clone();
             let scx2 = scx.clone();
+            let scx3 = scx.clone();
             out_inflight
                 .on_push(move || {
                     scx1.stats.out_inflights.inc();
                 })
                 .on_pop(move || {
                     scx2.stats.out_inflights.dec();
+                })
+                .on_drop(move |remaining| {
+                    scx3.stats.out_inflights.decs(remaining as isize);
+                    scx3.stats.out_inflight_drops.incs(remaining as isize);
+                    log::error!(
+                        "destroyed an outbound inflight window with {remaining} unacknowledged messages"
+                    );
                 })
         };
 

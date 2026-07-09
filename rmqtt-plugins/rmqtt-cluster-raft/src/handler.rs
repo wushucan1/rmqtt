@@ -16,7 +16,10 @@ use rmqtt_raft::Mailbox;
 
 use super::config::PluginConfig;
 use super::message::{Message, RaftGrpcMessage, RaftGrpcMessageReply};
-use super::{hook_message_dropped, shared::ClusterShared};
+use super::{
+    hook_message_dropped,
+    shared::{effective_source_clean_start, ClusterShared},
+};
 
 pub(crate) struct HookHandler {
     scx: ServerContext,
@@ -132,16 +135,38 @@ impl Handler for HookHandler {
                         if let Err(droppeds) =
                             self.shared.forwards_to(from.clone(), publish, sub_rels.clone()).await
                         {
+                            let reason = droppeds
+                                .first()
+                                .map(|(_, _, _, reason)| reason.to_string())
+                                .unwrap_or_else(|| "local delivery failed".to_string());
                             hook_message_dropped(&self.scx, droppeds).await;
+                            return (
+                                false,
+                                Some(HookResult::GrpcMessageReply(Ok(MessageReply::Error(reason)))),
+                            );
                         }
-                        return (false, acc);
+                        return (false, Some(HookResult::GrpcMessageReply(Ok(MessageReply::Success))));
                     }
                     GrpcMessage::Kick(id, clean_start, clear_subscriptions, is_admin) => {
                         let mut entry = self.shared.inner().entry(id.clone());
-                        let new_acc = match entry.kick(*clean_start, *clear_subscriptions, *is_admin).await {
-                            Ok(o) => HookResult::GrpcMessageReply(Ok(MessageReply::Kick(o))),
-                            Err(e) => HookResult::GrpcMessageReply(Err(e)),
-                        };
+                        // A client such as LM Gateway reconnects with Clean
+                        // Start after the broker intentionally disconnects it.
+                        // On a draining source node, return the pending
+                        // queue/inflight state instead of silently discarding
+                        // it. The destination still sees the original Clean
+                        // Start and therefore does not restore subscriptions.
+                        let source_clean_start =
+                            effective_source_clean_start(*clean_start, self.shared.is_draining());
+                        if *clean_start && !source_clean_start {
+                            log::debug!(
+                                "{id:?} preserving pending session state for planned drain despite Clean Start"
+                            );
+                        }
+                        let new_acc =
+                            match entry.kick(source_clean_start, *clear_subscriptions, *is_admin).await {
+                                Ok(o) => HookResult::GrpcMessageReply(Ok(MessageReply::Kick(o))),
+                                Err(e) => HookResult::GrpcMessageReply(Err(e)),
+                            };
                         return (false, Some(new_acc));
                     }
                     GrpcMessage::GetRetains(topic_filter) => {

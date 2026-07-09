@@ -1,6 +1,7 @@
 target/
 .idea/
 .*
+!.dockerignore
 */.idea/
 */Cargo.lock
 */target/

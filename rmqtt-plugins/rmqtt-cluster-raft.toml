@@ -31,6 +31,16 @@ raft_peer_addrs = ["1@127.0.0.1:6003", "2@127.0.0.1:6004", "3@127.0.0.1:6005"]
 #will be designated as the Leader. Default value: 0
 leader_id = 0
 
+#Explicitly control whether this node may create a brand-new raft cluster.
+#Leave unset to preserve the legacy automatic behavior. Kubernetes operators
+#should set this to true only for the first bootstrap pod and false afterwards.
+#bootstrap = false
+
+#Join an existing cluster as a non-voting learner. Keep false for legacy
+#standalone deployments; the RMQTT Operator renders this as true and promotes
+#the node only after snapshot restoration and log catch-up are confirmed.
+join_as_learner = false
+
 #Handshake lock timeout
 try_lock_timeout = "10s"
 task_exec_queue_workers = 500
