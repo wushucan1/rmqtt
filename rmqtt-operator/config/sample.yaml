@@ -6,7 +6,7 @@ metadata:
 spec:
   replicas: 3
   image: registry.cn-sh-02.sensecore.cn/ccr-ams-public/mirror/docker/rmqtt-test/rmqtt:latest
-  imagePullPolicy: Always
+  imagePullPolicy: IfNotPresent
   service:
     mqttPort: 1883
     mqttsPort: 8883

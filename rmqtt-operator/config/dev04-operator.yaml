@@ -67,7 +67,7 @@ spec:
       containers:
         - name: operator
           image: registry.cn-sh-02.sensecore.cn/ccr-ams-public/mirror/docker/rmqtt-test/rmqtt-operator:latest
-          imagePullPolicy: Always
+          imagePullPolicy: IfNotPresent
           env:
             - name: NAMESPACE
               value: studio-ams-system

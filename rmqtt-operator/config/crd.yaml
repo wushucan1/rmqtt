@@ -34,7 +34,7 @@ spec:
                 imagePullPolicy:
                   type: string
                   enum: [Always, IfNotPresent, Never]
-                  default: Always
+                  default: IfNotPresent
                 service:
                   type: object
                   properties:

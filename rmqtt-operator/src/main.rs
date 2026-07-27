@@ -541,7 +541,7 @@ fn default_image() -> String {
 }
 
 fn default_image_pull_policy() -> String {
-    "Always".to_string()
+    "IfNotPresent".to_string()
 }
 
 fn default_mqtt_port() -> i32 {
@@ -2421,7 +2421,7 @@ mod tests {
         let spec: ClusterSpec = serde_json::from_value(json!({
             "replicas": 3,
             "image": "example/rmqtt:test",
-            "imagePullPolicy": "Always",
+            "imagePullPolicy": "IfNotPresent",
             "service": {
                 "mqttPort": 1883,
                 "mqttsPort": 8883,
@@ -2494,7 +2494,7 @@ mod tests {
             "spec": {
                 "replicas": 3,
                 "image": "example/rmqtt:test",
-                "imagePullPolicy": "Always",
+                "imagePullPolicy": "IfNotPresent",
                 "config": {"baseConfigMapName": "ams-rmqtt-base-config"},
                 "resources": {
                     "requests": {"cpu": "8", "memory": "8Gi"},
