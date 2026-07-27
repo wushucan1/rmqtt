@@ -66,7 +66,7 @@ spec:
         - name: image-pull-secret-public
       containers:
         - name: operator
-          image: registry.cn-sh-02.sensecore.cn/ccr-ams-public/mirror/docker/rmqtt-test/rmqtt-operator:latest
+          image: registry.cn-sh-02.sensecore.cn/ccr-ams-public/mirror/docker/rmqtt-test/rmqtt-operator:dynamic-peers-202607271410
           imagePullPolicy: IfNotPresent
           env:
             - name: NAMESPACE

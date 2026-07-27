@@ -5,7 +5,7 @@ metadata:
   namespace: studio-ams-system
 spec:
   replicas: 3
-  image: registry.cn-sh-02.sensecore.cn/ccr-ams-public/mirror/docker/rmqtt-test/rmqtt:latest
+  image: registry.cn-sh-02.sensecore.cn/ccr-ams-public/mirror/docker/rmqtt-test/rmqtt:dynamic-peers-202607271410
   imagePullPolicy: IfNotPresent
   service:
     mqttPort: 1883
