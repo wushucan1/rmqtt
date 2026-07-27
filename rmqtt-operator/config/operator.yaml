@@ -22,13 +22,16 @@ rules:
     resources: ["rmqttclusters/status"]
     verbs: ["get", "patch", "update"]
   - apiGroups: [""]
-    resources: ["configmaps", "services", "pods"]
+    resources: ["configmaps", "services", "pods", "serviceaccounts"]
     verbs: ["get", "list", "watch", "create", "patch", "update"]
   - apiGroups: ["apps"]
     resources: ["statefulsets"]
     verbs: ["get", "list", "watch", "create", "patch", "update"]
   - apiGroups: ["policy"]
     resources: ["poddisruptionbudgets"]
+    verbs: ["get", "list", "watch", "create", "patch", "update"]
+  - apiGroups: ["monitoring.coreos.com"]
+    resources: ["servicemonitors"]
     verbs: ["get", "list", "watch", "create", "patch", "update"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -65,8 +68,8 @@ spec:
       serviceAccountName: rmqtt-operator
       containers:
         - name: operator
-          image: registry.cn-sh-02.sensecore.cn/ccr-ams-public/mirror/docker/rmqtt-test/rmqtt-operator:raft-operator-20260714
-          imagePullPolicy: IfNotPresent
+          image: registry.cn-sh-02.sensecore.cn/ccr-ams-public/mirror/docker/rmqtt-test/rmqtt-operator:latest
+          imagePullPolicy: Always
           env:
             - name: NAMESPACE
               value: rmqtt-test

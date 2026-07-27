@@ -1,7 +1,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use reqwest::{Client, Method, StatusCode};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::env;
@@ -14,19 +14,25 @@ const VERSION: &str = "v1alpha1";
 const PLURAL: &str = "rmqttclusters";
 const FIELD_MANAGER: &str = "rmqtt-operator";
 const DEFAULT_NAMESPACE: &str = "rmqtt-test";
-const DEFAULT_IMAGE: &str = "rmqtt-dynamic-test:official-amd64-20260713-155254";
+const DEFAULT_IMAGE: &str =
+    "registry.cn-sh-02.sensecore.cn/ccr-ams-public/mirror/docker/rmqtt-test/rmqtt:latest";
 
 const RENDER_SCRIPT: &str = r###"#!/bin/sh
 set -eu
 
 WORK_DIR="${RMQTT_WORK_DIR:-/work}"
 SOURCE_DIR="${RMQTT_SOURCE_DIR:-/app/rmqtt}"
+BASE_CONFIG_DIR="${RMQTT_BASE_CONFIG_DIR:-}"
 POD_NAME="${HOSTNAME}"
 ORDINAL="${POD_NAME##*-}"
 NODE_ID="$((ORDINAL + 1))"
 REPLICAS="${RMQTT_REPLICAS:-3}"
 HEADLESS="${RMQTT_HEADLESS_SERVICE}"
 NAMESPACE="${POD_NAMESPACE}"
+MQTT_PORT="${RMQTT_MQTT_PORT:-1883}"
+MQTTS_PORT="${RMQTT_MQTTS_PORT:-8883}"
+WS_PORT="${RMQTT_WS_PORT:-8080}"
+WSS_PORT="${RMQTT_WSS_PORT:-8083}"
 GRPC_PORT="${RMQTT_GRPC_PORT:-5363}"
 RAFT_PORT="${RMQTT_RAFT_PORT:-6003}"
 HTTP_PORT="${RMQTT_HTTP_API_PORT:-6060}"
@@ -42,6 +48,15 @@ cp "${SOURCE_DIR}/rmqtt.toml" "${WORK_DIR}/rmqtt.toml"
 cp "${SOURCE_DIR}"/rmqtt-plugins/*.toml "${WORK_DIR}/rmqtt-plugins/"
 cp "${SOURCE_DIR}/rmqtt-bin/rmqtt.pem" "${WORK_DIR}/rmqtt-bin/" 2>/dev/null || true
 cp "${SOURCE_DIR}/rmqtt-bin/rmqtt.key" "${WORK_DIR}/rmqtt-bin/" 2>/dev/null || true
+if [ -n "${BASE_CONFIG_DIR}" ]; then
+  if [ -f "${BASE_CONFIG_DIR}/rmqtt.toml" ]; then
+    cp "${BASE_CONFIG_DIR}/rmqtt.toml" "${WORK_DIR}/rmqtt.toml"
+  fi
+  for config_file in "${BASE_CONFIG_DIR}"/rmqtt-*.toml; do
+    [ -f "${config_file}" ] || continue
+    cp "${config_file}" "${WORK_DIR}/rmqtt-plugins/"
+  done
+fi
 
 grpc_peers=""
 raft_peers=""
@@ -65,12 +80,19 @@ done
 
 sed -i "s/^node.id = .*/node.id = ${NODE_ID}/" "${WORK_DIR}/rmqtt.toml"
 sed -i "s#^rpc.server_addr = .*#rpc.server_addr = \"0.0.0.0:${GRPC_PORT}\"#" "${WORK_DIR}/rmqtt.toml"
-sed -i 's/^log.to = .*/log.to = "console"/' "${WORK_DIR}/rmqtt.toml"
+sed -i 's#^plugins.dir = .*#plugins.dir = "rmqtt-plugins/"#' "${WORK_DIR}/rmqtt.toml"
+sed -i "s#^listener.tcp.external.addr = .*#listener.tcp.external.addr = \"0.0.0.0:${MQTT_PORT}\"#" "${WORK_DIR}/rmqtt.toml"
+sed -i "s#^listener.tls.external.addr = .*#listener.tls.external.addr = \"0.0.0.0:${MQTTS_PORT}\"#" "${WORK_DIR}/rmqtt.toml"
+sed -i "s#^listener.ws.external.addr = .*#listener.ws.external.addr = \"0.0.0.0:${WS_PORT}\"#" "${WORK_DIR}/rmqtt.toml"
+sed -i "s#^listener.wss.external.addr = .*#listener.wss.external.addr = \"0.0.0.0:${WSS_PORT}\"#" "${WORK_DIR}/rmqtt.toml"
 sed -i 's/#"rmqtt-cluster-raft"/"rmqtt-cluster-raft"/' "${WORK_DIR}/rmqtt.toml"
 
 sed -i "s#^http_laddr = .*#http_laddr = \"0.0.0.0:${HTTP_PORT}\"#" "${WORK_DIR}/rmqtt-plugins/rmqtt-http-api.toml"
 sed -i "s#^node_grpc_addrs = .*#node_grpc_addrs = [${grpc_peers}]#" "${WORK_DIR}/rmqtt-plugins/rmqtt-cluster-raft.toml"
 sed -i "s#^raft_peer_addrs = .*#raft_peer_addrs = [${raft_peers}]#" "${WORK_DIR}/rmqtt-plugins/rmqtt-cluster-raft.toml"
+if [ -f "${WORK_DIR}/rmqtt-plugins/rmqtt-cluster-broadcast.toml" ]; then
+  sed -i "s#^node_grpc_addrs = .*#node_grpc_addrs = [${grpc_peers}]#" "${WORK_DIR}/rmqtt-plugins/rmqtt-cluster-broadcast.toml"
+fi
 if grep -q '^leader_id = ' "${WORK_DIR}/rmqtt-plugins/rmqtt-cluster-raft.toml"; then
   sed -i 's/^leader_id = .*/leader_id = 1/' "${WORK_DIR}/rmqtt-plugins/rmqtt-cluster-raft.toml"
 else
@@ -127,10 +149,20 @@ struct ClusterSpec {
     replicas: i32,
     #[serde(default = "default_image")]
     image: String,
+    #[serde(default = "default_image_pull_policy")]
+    image_pull_policy: String,
     #[serde(default)]
     service: ServiceSpec,
     #[serde(default)]
     raft: RaftSpec,
+    #[serde(default)]
+    config: ConfigSpec,
+    #[serde(default)]
+    resources: Option<ResourceRequirementsSpec>,
+    #[serde(default)]
+    pod: BrokerPodSpec,
+    #[serde(default)]
+    monitoring: MonitoringSpec,
 }
 
 impl Default for ClusterSpec {
@@ -138,8 +170,13 @@ impl Default for ClusterSpec {
         Self {
             replicas: default_replicas(),
             image: default_image(),
+            image_pull_policy: default_image_pull_policy(),
             service: ServiceSpec::default(),
             raft: RaftSpec::default(),
+            config: ConfigSpec::default(),
+            resources: None,
+            pod: BrokerPodSpec::default(),
+            monitoring: MonitoringSpec::default(),
         }
     }
 }
@@ -149,6 +186,12 @@ impl Default for ClusterSpec {
 struct ServiceSpec {
     #[serde(default = "default_mqtt_port")]
     mqtt_port: i32,
+    #[serde(default = "default_mqtts_port")]
+    mqtts_port: i32,
+    #[serde(default = "default_ws_port")]
+    ws_port: i32,
+    #[serde(default = "default_wss_port")]
+    wss_port: i32,
     #[serde(default = "default_http_api_port")]
     http_api_port: i32,
     #[serde(default = "default_grpc_port")]
@@ -161,9 +204,95 @@ impl Default for ServiceSpec {
     fn default() -> Self {
         Self {
             mqtt_port: default_mqtt_port(),
+            mqtts_port: default_mqtts_port(),
+            ws_port: default_ws_port(),
+            wss_port: default_wss_port(),
             http_api_port: default_http_api_port(),
             grpc_port: default_grpc_port(),
             raft_port: default_raft_port(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+struct ConfigSpec {
+    #[serde(default)]
+    base_config_map_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+struct ResourceRequirementsSpec {
+    #[serde(default)]
+    requests: ResourceListSpec,
+    #[serde(default)]
+    limits: ResourceListSpec,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+struct ResourceListSpec {
+    #[serde(default)]
+    cpu: Option<String>,
+    #[serde(default)]
+    memory: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+struct BrokerPodSpec {
+    #[serde(default)]
+    annotations: BTreeMap<String, String>,
+    #[serde(default)]
+    service_account_name: Option<String>,
+    #[serde(default)]
+    image_pull_secrets: Vec<NamedReference>,
+    #[serde(default)]
+    scheduler_name: Option<String>,
+    #[serde(default)]
+    affinity: Option<Value>,
+    #[serde(default)]
+    tolerations: Vec<Value>,
+    #[serde(default)]
+    enable_service_links: Option<bool>,
+    #[serde(default)]
+    termination_grace_period_seconds: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+struct NamedReference {
+    name: String,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+struct MonitoringSpec {
+    #[serde(default)]
+    service_monitor: ServiceMonitorSpec,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct ServiceMonitorSpec {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    labels: BTreeMap<String, String>,
+    #[serde(default = "default_metrics_path")]
+    path: String,
+    #[serde(default = "default_metrics_interval")]
+    interval: String,
+    #[serde(default = "default_metrics_scrape_timeout")]
+    scrape_timeout: String,
+}
+
+impl Default for ServiceMonitorSpec {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            labels: BTreeMap::new(),
+            path: default_metrics_path(),
+            interval: default_metrics_interval(),
+            scrape_timeout: default_metrics_scrape_timeout(),
         }
     }
 }
@@ -411,8 +540,24 @@ fn default_image() -> String {
     DEFAULT_IMAGE.to_string()
 }
 
+fn default_image_pull_policy() -> String {
+    "Always".to_string()
+}
+
 fn default_mqtt_port() -> i32 {
     1883
+}
+
+fn default_mqtts_port() -> i32 {
+    8883
+}
+
+fn default_ws_port() -> i32 {
+    8080
+}
+
+fn default_wss_port() -> i32 {
+    8083
 }
 
 fn default_http_api_port() -> i32 {
@@ -429,6 +574,18 @@ fn default_raft_port() -> i32 {
 
 fn default_drain_timeout_seconds() -> u64 {
     300
+}
+
+fn default_metrics_path() -> String {
+    "/api/v1/metrics/prometheus/sum".to_string()
+}
+
+fn default_metrics_interval() -> String {
+    "60s".to_string()
+}
+
+fn default_metrics_scrape_timeout() -> String {
+    "10s".to_string()
 }
 
 #[tokio::main]
@@ -477,10 +634,13 @@ async fn reconcile_all(kube: &KubeClient, namespace: &str) -> Result<()> {
 async fn reconcile_cluster(kube: &KubeClient, namespace: &str, cluster: RmqttCluster) -> Result<()> {
     let name = cluster.metadata.name.as_str();
     validate_spec(&cluster.spec)?;
+    ensure_base_config_map_exists(kube, namespace, &cluster).await?;
 
+    apply_broker_service_account(kube, namespace, &cluster).await?;
     apply_config_map(kube, namespace, &cluster).await?;
     apply_services(kube, namespace, &cluster).await?;
     apply_pod_disruption_budget(kube, namespace, &cluster).await?;
+    apply_service_monitor(kube, namespace, &cluster).await?;
 
     let stateful_set = get_stateful_set(kube, namespace, name).await?;
     let Some(stateful_set) = stateful_set else {
@@ -802,6 +962,43 @@ fn validate_spec(spec: &ClusterSpec) -> Result<()> {
     if spec.replicas < 1 {
         bail!("spec.replicas must be >= 1");
     }
+    if !matches!(spec.image_pull_policy.as_str(), "Always" | "IfNotPresent" | "Never") {
+        bail!(
+            "spec.imagePullPolicy must be one of Always, IfNotPresent or Never, got {}",
+            spec.image_pull_policy
+        );
+    }
+    for (name, port) in [
+        ("mqttPort", spec.service.mqtt_port),
+        ("mqttsPort", spec.service.mqtts_port),
+        ("wsPort", spec.service.ws_port),
+        ("wssPort", spec.service.wss_port),
+        ("httpApiPort", spec.service.http_api_port),
+        ("grpcPort", spec.service.grpc_port),
+        ("raftPort", spec.service.raft_port),
+    ] {
+        if !(1..=65535).contains(&port) {
+            bail!("spec.service.{name} must be between 1 and 65535, got {port}");
+        }
+    }
+    Ok(())
+}
+
+async fn ensure_base_config_map_exists(
+    kube: &KubeClient,
+    namespace: &str,
+    cluster: &RmqttCluster,
+) -> Result<()> {
+    let Some(config_map_name) = cluster.spec.config.base_config_map_name.as_deref() else {
+        return Ok(());
+    };
+    kube.get_json::<Value>(&format!("/api/v1/namespaces/{namespace}/configmaps/{config_map_name}"))
+        .await
+        .with_context(|| {
+            format!(
+                "spec.config.baseConfigMapName references missing or unreadable ConfigMap {namespace}/{config_map_name}"
+            )
+        })?;
     Ok(())
 }
 
@@ -1594,6 +1791,26 @@ async fn apply_config_map(kube: &KubeClient, namespace: &str, cluster: &RmqttClu
     kube.apply(&format!("/api/v1/namespaces/{namespace}/configmaps/{name}"), &obj).await
 }
 
+async fn apply_broker_service_account(
+    kube: &KubeClient,
+    namespace: &str,
+    cluster: &RmqttCluster,
+) -> Result<()> {
+    let Some(service_account_name) = cluster.spec.pod.service_account_name.as_deref() else {
+        return Ok(());
+    };
+    let obj = json!({
+        "apiVersion": "v1",
+        "kind": "ServiceAccount",
+        "metadata": {
+            "name": service_account_name,
+            "namespace": namespace,
+            "labels": labels(&cluster.metadata.name),
+        }
+    });
+    kube.apply(&format!("/api/v1/namespaces/{namespace}/serviceaccounts/{service_account_name}"), &obj).await
+}
+
 async fn apply_services(kube: &KubeClient, namespace: &str, cluster: &RmqttCluster) -> Result<()> {
     let name = cluster.metadata.name.as_str();
     let headless = format!("{name}-headless");
@@ -1612,7 +1829,7 @@ async fn apply_services(kube: &KubeClient, namespace: &str, cluster: &RmqttClust
             "clusterIP": "None",
             "publishNotReadyAddresses": true,
             "selector": pod_selector,
-            "ports": service_ports(&cluster.spec.service),
+            "ports": headless_service_ports(&cluster.spec.service),
         }
     });
     kube.apply(&format!("/api/v1/namespaces/{namespace}/services/{name}-headless"), &headless_obj).await?;
@@ -1629,10 +1846,7 @@ async fn apply_services(kube: &KubeClient, namespace: &str, cluster: &RmqttClust
         },
         "spec": {
             "selector": client_selector,
-            "ports": [
-                {"name": "mqtt", "port": cluster.spec.service.mqtt_port, "targetPort": "mqtt"},
-                {"name": "http-api", "port": cluster.spec.service.http_api_port, "targetPort": "http-api"}
-            ]
+            "ports": client_service_ports(&cluster.spec.service),
         }
     });
     kube.apply(&format!("/api/v1/namespaces/{namespace}/services/{name}"), &client_obj).await
@@ -1660,6 +1874,36 @@ async fn apply_pod_disruption_budget(
     kube.apply(&format!("/apis/policy/v1/namespaces/{namespace}/poddisruptionbudgets/{name}"), &obj).await
 }
 
+async fn apply_service_monitor(kube: &KubeClient, namespace: &str, cluster: &RmqttCluster) -> Result<()> {
+    let spec = &cluster.spec.monitoring.service_monitor;
+    if !spec.enabled {
+        return Ok(());
+    }
+    let name = cluster.metadata.name.as_str();
+    let mut monitor_labels = labels(name);
+    monitor_labels.extend(spec.labels.clone());
+    let obj = json!({
+        "apiVersion": "monitoring.coreos.com/v1",
+        "kind": "ServiceMonitor",
+        "metadata": {
+            "name": name,
+            "namespace": namespace,
+            "labels": monitor_labels,
+        },
+        "spec": {
+            "selector": {"matchLabels": selector(name)},
+            "endpoints": [{
+                "port": "http-api",
+                "path": spec.path,
+                "interval": spec.interval,
+                "scrapeTimeout": spec.scrape_timeout,
+            }]
+        }
+    });
+    kube.apply(&format!("/apis/monitoring.coreos.com/v1/namespaces/{namespace}/servicemonitors/{name}"), &obj)
+        .await
+}
+
 async fn apply_stateful_set(
     kube: &KubeClient,
     namespace: &str,
@@ -1668,10 +1912,125 @@ async fn apply_stateful_set(
     bootstrap_allowed: bool,
 ) -> Result<()> {
     let name = cluster.metadata.name.as_str();
+    let obj = stateful_set_object(namespace, cluster, replicas, bootstrap_allowed);
+    kube.apply(&format!("/apis/apps/v1/namespaces/{namespace}/statefulsets/{name}"), &obj).await
+}
+
+fn stateful_set_object(
+    namespace: &str,
+    cluster: &RmqttCluster,
+    replicas: i32,
+    bootstrap_allowed: bool,
+) -> Value {
+    let name = cluster.metadata.name.as_str();
     let labels = labels(name);
     let selector = selector(name);
     let scripts_name = format!("{name}-operator-scripts");
     let headless = format!("{name}-headless");
+    let mut env = vec![
+        json!({"name": "POD_NAMESPACE", "valueFrom": {"fieldRef": {"fieldPath": "metadata.namespace"}}}),
+        json!({"name": "RUST_BACKTRACE", "value": "1"}),
+        json!({"name": "RMQTT_NAME", "value": name}),
+        json!({"name": "RMQTT_HEADLESS_SERVICE", "value": format!("{name}-headless")}),
+        json!({"name": "RMQTT_REPLICAS", "value": replicas.to_string()}),
+        json!({"name": "RMQTT_MQTT_PORT", "value": cluster.spec.service.mqtt_port.to_string()}),
+        json!({"name": "RMQTT_MQTTS_PORT", "value": cluster.spec.service.mqtts_port.to_string()}),
+        json!({"name": "RMQTT_WS_PORT", "value": cluster.spec.service.ws_port.to_string()}),
+        json!({"name": "RMQTT_WSS_PORT", "value": cluster.spec.service.wss_port.to_string()}),
+        json!({"name": "RMQTT_HTTP_API_PORT", "value": cluster.spec.service.http_api_port.to_string()}),
+        json!({"name": "RMQTT_GRPC_PORT", "value": cluster.spec.service.grpc_port.to_string()}),
+        json!({"name": "RMQTT_RAFT_PORT", "value": cluster.spec.service.raft_port.to_string()}),
+        json!({"name": "RMQTT_RAFT_BOOTSTRAP", "value": bootstrap_allowed.to_string()}),
+    ];
+    let mut volume_mounts = vec![
+        json!({"name": "work", "mountPath": "/work"}),
+        json!({"name": "rmqtt-data", "mountPath": "/var/lib/rmqtt"}),
+        json!({"name": "operator-scripts", "mountPath": "/operator-scripts", "readOnly": true}),
+    ];
+    let mut volumes = vec![
+        json!({"name": "work", "emptyDir": {}}),
+        json!({"name": "rmqtt-data", "emptyDir": {}}),
+        json!({"name": "operator-scripts", "configMap": {"name": scripts_name, "defaultMode": 493}}),
+    ];
+    if let Some(base_config_map_name) = cluster.spec.config.base_config_map_name.as_deref() {
+        env.push(json!({"name": "RMQTT_BASE_CONFIG_DIR", "value": "/base-config"}));
+        volume_mounts.push(json!({
+            "name": "base-config",
+            "mountPath": "/base-config",
+            "readOnly": true
+        }));
+        volumes.push(json!({
+            "name": "base-config",
+            "configMap": {"name": base_config_map_name}
+        }));
+    }
+
+    let mut container = json!({
+        "name": "rmqtt",
+        "image": cluster.spec.image,
+        "imagePullPolicy": cluster.spec.image_pull_policy,
+        "command": ["/bin/sh", "-ec"],
+        "args": [
+            "/operator-scripts/render-rmqtt-config.sh && cd /work && exec /app/rmqtt/rmqtt-bin/rmqttd --config /work/rmqtt.toml --plugins-default-startups rmqtt-cluster-raft rmqtt-sys-topic rmqtt-http-api"
+        ],
+        "env": env,
+        "ports": [
+            {"name": "mqtt", "containerPort": cluster.spec.service.mqtt_port, "protocol": "TCP"},
+            {"name": "mqtts", "containerPort": cluster.spec.service.mqtts_port, "protocol": "TCP"},
+            {"name": "ws", "containerPort": cluster.spec.service.ws_port, "protocol": "TCP"},
+            {"name": "wss", "containerPort": cluster.spec.service.wss_port, "protocol": "TCP"},
+            {"name": "http-api", "containerPort": cluster.spec.service.http_api_port, "protocol": "TCP"},
+            {"name": "cluster-grpc", "containerPort": cluster.spec.service.grpc_port, "protocol": "TCP"},
+            {"name": "cluster-raft", "containerPort": cluster.spec.service.raft_port, "protocol": "TCP"}
+        ],
+        "startupProbe": {
+            "tcpSocket": {"port": "http-api"},
+            "periodSeconds": 5,
+            "timeoutSeconds": 10,
+            "failureThreshold": 120
+        },
+        "livenessProbe": {
+            "tcpSocket": {"port": "mqtt"},
+            "initialDelaySeconds": 20,
+            "periodSeconds": 10,
+            "timeoutSeconds": 10,
+            "failureThreshold": 3
+        },
+        "readinessProbe": {
+            "httpGet": {"path": "/api/v1/health/ready", "port": "http-api"},
+            "initialDelaySeconds": 5,
+            "periodSeconds": 5,
+            "timeoutSeconds": 3,
+            "failureThreshold": 12
+        },
+        "volumeMounts": volume_mounts
+    });
+    if let Some(resources) = cluster.spec.resources.as_ref() {
+        container["resources"] = resource_requirements_json(resources);
+    }
+
+    let mut pod_spec = json!({
+        "containers": [container],
+        "volumes": volumes,
+        "enableServiceLinks": cluster.spec.pod.enable_service_links.unwrap_or(false),
+        "terminationGracePeriodSeconds": cluster.spec.pod.termination_grace_period_seconds.unwrap_or(30),
+    });
+    if let Some(service_account_name) = cluster.spec.pod.service_account_name.as_deref() {
+        pod_spec["serviceAccountName"] = json!(service_account_name);
+    }
+    if !cluster.spec.pod.image_pull_secrets.is_empty() {
+        pod_spec["imagePullSecrets"] = json!(cluster.spec.pod.image_pull_secrets);
+    }
+    if let Some(scheduler_name) = cluster.spec.pod.scheduler_name.as_deref() {
+        pod_spec["schedulerName"] = json!(scheduler_name);
+    }
+    if let Some(affinity) = cluster.spec.pod.affinity.as_ref() {
+        pod_spec["affinity"] = affinity.clone();
+    }
+    if !cluster.spec.pod.tolerations.is_empty() {
+        pod_spec["tolerations"] = json!(cluster.spec.pod.tolerations);
+    }
+
     let obj = json!({
         "apiVersion": "apps/v1",
         "kind": "StatefulSet",
@@ -1691,6 +2050,7 @@ async fn apply_stateful_set(
             "selector": {"matchLabels": selector},
             "template": {
                 "metadata": {
+                    "annotations": cluster.spec.pod.annotations,
                     "labels": {
                         "app.kubernetes.io/name": "rmqtt",
                         "app.kubernetes.io/instance": name,
@@ -1701,52 +2061,29 @@ async fn apply_stateful_set(
                         "rmqtt.io/draining": "false"
                     }
                 },
-                "spec": {
-                    "containers": [{
-                        "name": "rmqtt",
-                        "image": cluster.spec.image,
-                        // TODO: @wy 临时修改
-                        "imagePullPolicy": "Always",
-                        "command": ["/bin/sh", "-ec"],
-                        "args": ["/operator-scripts/render-rmqtt-config.sh && cd /work && exec /app/rmqtt/rmqtt-bin/rmqttd"],
-                        "env": [
-                            {"name": "POD_NAMESPACE", "valueFrom": {"fieldRef": {"fieldPath": "metadata.namespace"}}},
-                            {"name": "RMQTT_NAME", "value": name},
-                            {"name": "RMQTT_HEADLESS_SERVICE", "value": format!("{name}-headless")},
-                            {"name": "RMQTT_REPLICAS", "value": replicas.to_string()},
-                            {"name": "RMQTT_MQTT_PORT", "value": cluster.spec.service.mqtt_port.to_string()},
-                            {"name": "RMQTT_HTTP_API_PORT", "value": cluster.spec.service.http_api_port.to_string()},
-                            {"name": "RMQTT_GRPC_PORT", "value": cluster.spec.service.grpc_port.to_string()},
-                            {"name": "RMQTT_RAFT_PORT", "value": cluster.spec.service.raft_port.to_string()},
-                            {"name": "RMQTT_RAFT_BOOTSTRAP", "value": bootstrap_allowed.to_string()}
-                        ],
-                        "ports": [
-                            {"name": "mqtt", "containerPort": cluster.spec.service.mqtt_port},
-                            {"name": "http-api", "containerPort": cluster.spec.service.http_api_port},
-                            {"name": "grpc", "containerPort": cluster.spec.service.grpc_port},
-                            {"name": "raft", "containerPort": cluster.spec.service.raft_port}
-                        ],
-                        "readinessProbe": {
-                            "httpGet": {"path": "/api/v1/health/ready", "port": "http-api"},
-                            "initialDelaySeconds": 5,
-                            "periodSeconds": 5,
-                            "timeoutSeconds": 3,
-                            "failureThreshold": 12
-                        },
-                        "volumeMounts": [
-                            {"name": "work", "mountPath": "/work"},
-                            {"name": "operator-scripts", "mountPath": "/operator-scripts"}
-                        ]
-                    }],
-                    "volumes": [
-                        {"name": "work", "emptyDir": {}},
-                        {"name": "operator-scripts", "configMap": {"name": scripts_name, "defaultMode": 493}}
-                    ]
-                }
+                "spec": pod_spec
             }
         }
     });
-    kube.apply(&format!("/apis/apps/v1/namespaces/{namespace}/statefulsets/{name}"), &obj).await
+    obj
+}
+
+fn resource_requirements_json(spec: &ResourceRequirementsSpec) -> Value {
+    fn resource_list_json(spec: &ResourceListSpec) -> Value {
+        let mut value = json!({});
+        if let Some(cpu) = spec.cpu.as_deref() {
+            value["cpu"] = json!(cpu);
+        }
+        if let Some(memory) = spec.memory.as_deref() {
+            value["memory"] = json!(memory);
+        }
+        value
+    }
+
+    json!({
+        "requests": resource_list_json(&spec.requests),
+        "limits": resource_list_json(&spec.limits),
+    })
 }
 
 async fn patch_pod_draining(kube: &KubeClient, namespace: &str, pod: &str) -> Result<()> {
@@ -1839,12 +2176,20 @@ fn selector(name: &str) -> BTreeMap<String, String> {
     selector
 }
 
-fn service_ports(spec: &ServiceSpec) -> Value {
+fn client_service_ports(spec: &ServiceSpec) -> Value {
     json!([
         {"name": "mqtt", "port": spec.mqtt_port, "targetPort": "mqtt"},
+        {"name": "mqtts", "port": spec.mqtts_port, "targetPort": "mqtts"},
+        {"name": "ws", "port": spec.ws_port, "targetPort": "ws"},
+        {"name": "wss", "port": spec.wss_port, "targetPort": "wss"},
         {"name": "http-api", "port": spec.http_api_port, "targetPort": "http-api"},
-        {"name": "grpc", "port": spec.grpc_port, "targetPort": "grpc"},
-        {"name": "raft", "port": spec.raft_port, "targetPort": "raft"}
+    ])
+}
+
+fn headless_service_ports(spec: &ServiceSpec) -> Value {
+    json!([
+        {"name": "cluster-grpc", "port": spec.grpc_port, "targetPort": "cluster-grpc"},
+        {"name": "cluster-raft", "port": spec.raft_port, "targetPort": "cluster-raft"}
     ])
 }
 
@@ -2069,6 +2414,134 @@ mod tests {
 
         let legacy: StatefulSet = serde_json::from_value(json!({"spec": {"replicas": 3}})).unwrap();
         assert!(!legacy.bootstrap_allowed());
+    }
+
+    #[test]
+    fn production_compatibility_fields_deserialize_and_render() {
+        let spec: ClusterSpec = serde_json::from_value(json!({
+            "replicas": 3,
+            "image": "example/rmqtt:test",
+            "imagePullPolicy": "Always",
+            "service": {
+                "mqttPort": 1883,
+                "mqttsPort": 8883,
+                "wsPort": 8080,
+                "wssPort": 8083,
+                "httpApiPort": 6060,
+                "grpcPort": 5363,
+                "raftPort": 6003
+            },
+            "config": {"baseConfigMapName": "ams-rmqtt-base-config"},
+            "resources": {
+                "requests": {"cpu": "8", "memory": "8Gi"},
+                "limits": {"cpu": "16", "memory": "16Gi"}
+            },
+            "pod": {
+                "annotations": {"ams.studio.sensecore.cn/scheduler": "volcano"},
+                "serviceAccountName": "ams-rmqtt",
+                "imagePullSecrets": [{"name": "image-pull-secret-public"}],
+                "schedulerName": "default-scheduler",
+                "enableServiceLinks": false,
+                "terminationGracePeriodSeconds": 30,
+                "affinity": {"nodeAffinity": {}},
+                "tolerations": [{"key": "dedicated", "operator": "Exists"}]
+            },
+            "monitoring": {
+                "serviceMonitor": {
+                    "enabled": true,
+                    "labels": {"release": "kube-prometheus-stack"}
+                }
+            },
+            "raft": {"minReplicas": 3}
+        }))
+        .unwrap();
+
+        validate_spec(&spec).unwrap();
+        assert_eq!(spec.service.mqtts_port, 8883);
+        assert_eq!(spec.service.ws_port, 8080);
+        assert_eq!(spec.service.wss_port, 8083);
+        assert_eq!(spec.config.base_config_map_name.as_deref(), Some("ams-rmqtt-base-config"));
+        assert_eq!(spec.pod.service_account_name.as_deref(), Some("ams-rmqtt"));
+        assert!(spec.monitoring.service_monitor.enabled);
+
+        let resources = resource_requirements_json(spec.resources.as_ref().unwrap());
+        assert_eq!(resources["requests"]["cpu"], "8");
+        assert_eq!(resources["limits"]["memory"], "16Gi");
+
+        let client_ports = client_service_ports(&spec.service);
+        let names = client_ports
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|port| port.get("name").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["mqtt", "mqtts", "ws", "wss", "http-api"]);
+    }
+
+    #[test]
+    fn render_script_overlays_base_config_and_dynamic_listener_ports() {
+        assert!(RENDER_SCRIPT.contains("RMQTT_BASE_CONFIG_DIR"));
+        assert!(RENDER_SCRIPT.contains("listener.tls.external.addr"));
+        assert!(RENDER_SCRIPT.contains("listener.ws.external.addr"));
+        assert!(RENDER_SCRIPT.contains("listener.wss.external.addr"));
+        assert!(RENDER_SCRIPT.contains("rmqtt-cluster-broadcast.toml"));
+    }
+
+    #[test]
+    fn stateful_set_preserves_runtime_and_scheduling_compatibility() {
+        let cluster: RmqttCluster = serde_json::from_value(json!({
+            "metadata": {"name": "ams-rmqtt"},
+            "spec": {
+                "replicas": 3,
+                "image": "example/rmqtt:test",
+                "imagePullPolicy": "Always",
+                "config": {"baseConfigMapName": "ams-rmqtt-base-config"},
+                "resources": {
+                    "requests": {"cpu": "8", "memory": "8Gi"},
+                    "limits": {"cpu": "16", "memory": "16Gi"}
+                },
+                "pod": {
+                    "annotations": {"ams.studio.sensecore.cn/scheduler": "volcano"},
+                    "serviceAccountName": "ams-rmqtt",
+                    "imagePullSecrets": [
+                        {"name": "image-pull-secret-stack"},
+                        {"name": "image-pull-secret-public"}
+                    ],
+                    "schedulerName": "default-scheduler",
+                    "affinity": {"nodeAffinity": {"requiredDuringSchedulingIgnoredDuringExecution": {}}},
+                    "tolerations": [{"key": "dedicated", "operator": "Exists"}]
+                }
+            }
+        }))
+        .unwrap();
+
+        let object = stateful_set_object("studio-ams-system", &cluster, 3, false);
+        assert_eq!(object["spec"]["podManagementPolicy"], "OrderedReady");
+        assert_eq!(object["spec"]["updateStrategy"]["type"], "OnDelete");
+
+        let pod = &object["spec"]["template"]["spec"];
+        assert_eq!(pod["serviceAccountName"], "ams-rmqtt");
+        assert_eq!(pod["schedulerName"], "default-scheduler");
+        assert_eq!(pod["imagePullSecrets"].as_array().unwrap().len(), 2);
+
+        let container = &pod["containers"][0];
+        assert_eq!(container["resources"]["requests"]["cpu"], "8");
+        assert_eq!(container["resources"]["limits"]["memory"], "16Gi");
+        assert_eq!(container["startupProbe"]["tcpSocket"]["port"], "http-api");
+        assert_eq!(container["livenessProbe"]["tcpSocket"]["port"], "mqtt");
+        assert_eq!(container["readinessProbe"]["httpGet"]["path"], "/api/v1/health/ready");
+
+        let port_names = container["ports"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|port| port.get("name").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            port_names,
+            vec!["mqtt", "mqtts", "ws", "wss", "http-api", "cluster-grpc", "cluster-raft"]
+        );
+        assert!(pod["volumes"].as_array().unwrap().iter().any(|volume| volume["name"] == "base-config"));
     }
 
     #[test]

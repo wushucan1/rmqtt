@@ -1,0 +1,75 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: rmqtt-operator
+  namespace: studio-ams-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: rmqtt-operator
+  namespace: studio-ams-system
+rules:
+  - apiGroups: ["rmqtt.io"]
+    resources: ["rmqttclusters"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["rmqtt.io"]
+    resources: ["rmqttclusters/status"]
+    verbs: ["get", "patch", "update"]
+  - apiGroups: [""]
+    resources: ["configmaps", "services", "pods", "serviceaccounts"]
+    verbs: ["get", "list", "watch", "create", "patch", "update"]
+  - apiGroups: ["apps"]
+    resources: ["statefulsets"]
+    verbs: ["get", "list", "watch", "create", "patch", "update"]
+  - apiGroups: ["policy"]
+    resources: ["poddisruptionbudgets"]
+    verbs: ["get", "list", "watch", "create", "patch", "update"]
+  - apiGroups: ["monitoring.coreos.com"]
+    resources: ["servicemonitors"]
+    verbs: ["get", "list", "watch", "create", "patch", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: rmqtt-operator
+  namespace: studio-ams-system
+subjects:
+  - kind: ServiceAccount
+    name: rmqtt-operator
+    namespace: studio-ams-system
+roleRef:
+  kind: Role
+  name: rmqtt-operator
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rmqtt-operator
+  namespace: studio-ams-system
+  labels:
+    app.kubernetes.io/name: rmqtt-operator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: rmqtt-operator
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: rmqtt-operator
+    spec:
+      serviceAccountName: rmqtt-operator
+      imagePullSecrets:
+        - name: image-pull-secret-stack
+        - name: image-pull-secret-public
+      containers:
+        - name: operator
+          image: registry.cn-sh-02.sensecore.cn/ccr-ams-public/mirror/docker/rmqtt-test/rmqtt-operator:latest
+          imagePullPolicy: Always
+          env:
+            - name: NAMESPACE
+              value: studio-ams-system
+            - name: RECONCILE_INTERVAL_SECONDS
+              value: "5"

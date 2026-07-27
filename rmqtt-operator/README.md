@@ -68,7 +68,7 @@ docker buildx build --platform linux/amd64 \
 The RMQTT broker image used by the sample is:
 
 ```text
-rmqtt-dynamic-test:official-amd64-20260713-155254
+registry.cn-sh-02.sensecore.cn/ccr-ams-public/mirror/docker/rmqtt-test/rmqtt:latest
 ```
 
 ## Deploy
@@ -84,6 +84,51 @@ The default namespace is:
 ```text
 rmqtt-test
 ```
+
+## Existing Cluster Compatibility
+
+`spec.service` supports the client-facing MQTT, MQTTS, WebSocket, secure
+WebSocket and HTTP API ports independently from the headless gRPC/Raft ports.
+`spec.resources`, `spec.pod` and `spec.monitoring.serviceMonitor` preserve the
+resource guarantees, scheduling constraints, image pull secrets and monitoring
+settings of an existing Helm deployment.
+
+An existing RMQTT ConfigMap can be reused through
+`spec.config.baseConfigMapName`. The operator copies the base files into a
+writable work directory, then overrides only values owned by the dynamic
+cluster lifecycle:
+
+- local node ID
+- MQTT/MQTTS/WS/WSS, HTTP API, gRPC and Raft listen ports
+- Raft and business-layer peer lists
+- controlled-bootstrap and learner-join flags
+
+All other broker settings, including packet limits, MQTT inflight and message
+queue limits, session expiry, logging and Raft tuning, remain inherited from
+the base ConfigMap.
+
+For the `studio-ams-system/ams-rmqtt` dev04 replacement, preserve the current
+Helm-generated configuration before uninstalling the old release:
+
+```bash
+kubectl -n studio-ams-system get configmap ams-rmqtt-config -o json \
+  | jq 'del(.metadata.annotations,.metadata.creationTimestamp,.metadata.labels,.metadata.managedFields,.metadata.ownerReferences,.metadata.resourceVersion,.metadata.uid) |
+        .metadata.name = "ams-rmqtt-base-config"' \
+  | kubectl apply -f -
+```
+
+Then deploy the dev04 operator and cluster manifests:
+
+```bash
+kubectl apply -f rmqtt-operator/config/crd.yaml
+kubectl apply -f rmqtt-operator/config/dev04-operator.yaml
+kubectl apply -f rmqtt-operator/config/dev04.yaml
+```
+
+The dev04 manifest intentionally differs from the legacy StatefulSet only
+where the safe dynamic lifecycle requires it: `OrderedReady`, `OnDelete`, the
+Raft-aware readiness endpoint, client traffic admission, learner catch-up,
+drain and one-at-a-time membership changes.
 
 ## Scale Out
 
