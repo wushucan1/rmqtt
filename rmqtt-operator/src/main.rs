@@ -3,8 +3,9 @@ use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use reqwest::{Client, Method, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::env;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use tokio::fs;
 use tokio::time::sleep;
@@ -16,6 +17,8 @@ const FIELD_MANAGER: &str = "rmqtt-operator";
 const DEFAULT_NAMESPACE: &str = "rmqtt-test";
 const DEFAULT_IMAGE: &str =
     "registry.cn-sh-02.sensecore.cn/ccr-ams-public/mirror/docker/rmqtt-test/rmqtt:latest";
+
+static LAST_LOGGED_STATUS: OnceLock<Mutex<HashMap<String, Value>>> = OnceLock::new();
 
 const RENDER_SCRIPT: &str = r###"#!/bin/sh
 set -eu
@@ -590,6 +593,8 @@ fn default_metrics_scrape_timeout() -> String {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
     let namespace = env::var("NAMESPACE").unwrap_or_else(|_| {
         std::fs::read_to_string("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
             .map(|s| s.trim().to_string())
@@ -599,11 +604,11 @@ async fn main() -> Result<()> {
         env::var("RECONCILE_INTERVAL_SECONDS").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(5);
 
     let kube = KubeClient::in_cluster().await?;
-    println!("rmqtt-operator started, namespace={namespace}, interval={interval}s");
+    log::info!("operator started namespace={namespace} reconcile_interval_seconds={interval}");
 
     loop {
         if let Err(e) = reconcile_all(&kube, &namespace).await {
-            eprintln!("reconcile error: {e:?}");
+            log::error!("reconcile failed namespace={namespace} error={e:?}");
         }
         sleep(Duration::from_secs(interval)).await;
     }
@@ -614,7 +619,12 @@ async fn reconcile_all(kube: &KubeClient, namespace: &str) -> Result<()> {
     let clusters: ObjectList<RmqttCluster> = kube.get_json(&path).await?;
     for cluster in clusters.items {
         if let Err(e) = reconcile_cluster(kube, namespace, cluster.clone()).await {
-            eprintln!("cluster {} reconcile error: {e:?}", cluster.metadata.name);
+            log::error!(
+                "cluster reconcile failed namespace={} cluster={} generation={:?} error={e:?}",
+                namespace,
+                cluster.metadata.name,
+                cluster.metadata.generation
+            );
             let _ = patch_status(
                 kube,
                 namespace,
@@ -633,6 +643,13 @@ async fn reconcile_all(kube: &KubeClient, namespace: &str) -> Result<()> {
 
 async fn reconcile_cluster(kube: &KubeClient, namespace: &str, cluster: RmqttCluster) -> Result<()> {
     let name = cluster.metadata.name.as_str();
+    log::debug!(
+        "reconciling cluster namespace={} cluster={} generation={:?} desired_replicas={}",
+        namespace,
+        name,
+        cluster.metadata.generation,
+        cluster.spec.replicas
+    );
     validate_spec(&cluster.spec)?;
     ensure_base_config_map_exists(kube, namespace, &cluster).await?;
 
@@ -2153,12 +2170,88 @@ async fn ensure_unready_pods_not_serving(
 }
 
 async fn patch_status(kube: &KubeClient, namespace: &str, name: &str, status: Value) -> Result<()> {
-    let patch = json!({ "status": status });
+    let patch = json!({ "status": &status });
     kube.merge_patch(
         &format!("/apis/{GROUP}/{VERSION}/namespaces/{namespace}/{PLURAL}/{name}/status"),
         &patch,
     )
-    .await
+    .await?;
+    log_status_transition(namespace, name, &status);
+    Ok(())
+}
+
+fn status_log_signature(status: &Value) -> Value {
+    json!({
+        "phase": status.get("phase"),
+        "observedGeneration": status.get("observedGeneration"),
+        "replicas": status.get("replicas"),
+        "readyReplicas": status.get("readyReplicas"),
+        "desiredReplicas": status.get("desiredReplicas"),
+        "leaderId": status.get("leaderId"),
+        "membersReady": status.pointer("/raftStatus/membersReady"),
+        "drainingNodeId": status.get("drainingNodeId"),
+        "operationType": status.pointer("/operation/type"),
+        "operationPhase": status.pointer("/operation/phase"),
+        "operationMode": status.pointer("/operation/mode"),
+        "operationNodeId": status.pointer("/operation/nodeId"),
+        "confChangeType": status.pointer("/confChange/type"),
+        "confChangeNodeId": status.pointer("/confChange/nodeId"),
+    })
+}
+
+fn status_field(status: &Value, pointer: &str) -> String {
+    match status.pointer(pointer) {
+        Some(Value::String(value)) => value.clone(),
+        Some(Value::Number(value)) => value.to_string(),
+        Some(Value::Bool(value)) => value.to_string(),
+        Some(Value::Null) | None => "-".to_string(),
+        Some(value) => value.to_string(),
+    }
+}
+
+fn log_status_transition(namespace: &str, name: &str, status: &Value) {
+    let signature = status_log_signature(status);
+    let cache = LAST_LOGGED_STATUS.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = format!("{namespace}/{name}");
+    let changed = {
+        let mut statuses = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if statuses.get(&key) == Some(&signature) {
+            false
+        } else {
+            statuses.insert(key, signature);
+            true
+        }
+    };
+    if !changed {
+        return;
+    }
+
+    let phase = status_field(status, "/phase");
+    let generation = status_field(status, "/observedGeneration");
+    let replicas = status_field(status, "/replicas");
+    let ready_replicas = status_field(status, "/readyReplicas");
+    let desired_replicas = status_field(status, "/desiredReplicas");
+    let leader_id = status_field(status, "/leaderId");
+    let members_ready = status_field(status, "/raftStatus/membersReady");
+    let draining_node_id = status_field(status, "/drainingNodeId");
+    let operation_type = status_field(status, "/operation/type");
+    let operation_phase = status_field(status, "/operation/phase");
+    let operation_mode = status_field(status, "/operation/mode");
+    let operation_node_id = status_field(status, "/operation/nodeId");
+    let message = status_field(status, "/message");
+
+    let details = format!(
+        "cluster status changed namespace={namespace} cluster={name} generation={generation} phase={phase} \
+         replicas={replicas} ready_replicas={ready_replicas} desired_replicas={desired_replicas} \
+         leader_id={leader_id} members_ready={members_ready} draining_node_id={draining_node_id} \
+         operation_type={operation_type} operation_phase={operation_phase} operation_mode={operation_mode} \
+         operation_node_id={operation_node_id} message={message:?}"
+    );
+    if matches!(phase.as_str(), "Degraded" | "ScaleInBlocked") {
+        log::warn!("{details}");
+    } else {
+        log::info!("{details}");
+    }
 }
 
 fn labels(name: &str) -> BTreeMap<String, String> {
@@ -2393,6 +2486,58 @@ impl KubeClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn status_log_signature_deduplicates_message_only_updates() {
+        let first = json!({
+            "phase": "WaitingRaftCatchUp",
+            "message": "learner 4 matched index 10",
+            "observedGeneration": 2,
+            "replicas": 4,
+            "readyReplicas": 3,
+            "desiredReplicas": 5,
+            "leaderId": 1,
+            "operation": {
+                "type": "AddLearnerAndPromote",
+                "phase": "CatchingUp",
+                "mode": "LearnerCatchUp",
+                "nodeId": 4
+            }
+        });
+        let message_progress = json!({
+            "phase": "WaitingRaftCatchUp",
+            "message": "learner 4 matched index 20",
+            "observedGeneration": 2,
+            "replicas": 4,
+            "readyReplicas": 3,
+            "desiredReplicas": 5,
+            "leaderId": 1,
+            "operation": {
+                "type": "AddLearnerAndPromote",
+                "phase": "CatchingUp",
+                "mode": "LearnerCatchUp",
+                "nodeId": 4
+            }
+        });
+        let promoted = json!({
+            "phase": "PromotingRaftLearner",
+            "message": "learner 4 caught up and promotion was requested",
+            "observedGeneration": 2,
+            "replicas": 4,
+            "readyReplicas": 3,
+            "desiredReplicas": 5,
+            "leaderId": 1,
+            "operation": {
+                "type": "AddLearnerAndPromote",
+                "phase": "Promoting",
+                "mode": "LearnerCatchUp",
+                "nodeId": 4
+            }
+        });
+
+        assert_eq!(status_log_signature(&first), status_log_signature(&message_progress));
+        assert_ne!(status_log_signature(&first), status_log_signature(&promoted));
+    }
 
     #[test]
     fn stateful_set_bootstrap_annotation_is_explicit() {

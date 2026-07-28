@@ -73,3 +73,5 @@ spec:
               value: studio-ams-system
             - name: RECONCILE_INTERVAL_SECONDS
               value: "5"
+            - name: RUST_LOG
+              value: info

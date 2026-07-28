@@ -85,6 +85,27 @@ The default namespace is:
 rmqtt-test
 ```
 
+## Logging
+
+The operator uses `RUST_LOG` and defaults to `info`. The deployment manifests
+set it explicitly:
+
+```yaml
+env:
+  - name: RUST_LOG
+    value: info
+```
+
+INFO logs are state-transition based rather than reconcile-loop based. The
+operator logs a new CR generation, bootstrap, scale-out, learner catch-up,
+learner promotion, pod readiness, drain, leadership transfer, scale-in,
+Running, blocked states and errors only when their status signature changes.
+Changing progress text alone does not emit a new line, so the five-second
+reconcile interval does not create repeated INFO logs.
+
+Set `RUST_LOG=debug` only while diagnosing a problem. DEBUG includes every
+cluster reconcile cycle and is intentionally more verbose.
+
 ## Existing Cluster Compatibility
 
 `spec.service` supports the client-facing MQTT, MQTTS, WebSocket, secure

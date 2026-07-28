@@ -75,3 +75,5 @@ spec:
               value: rmqtt-test
             - name: RECONCILE_INTERVAL_SECONDS
               value: "5"
+            - name: RUST_LOG
+              value: info

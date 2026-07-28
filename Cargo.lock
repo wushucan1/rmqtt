@@ -4992,6 +4992,8 @@ name = "rmqtt-operator"
 version = "0.19.0"
 dependencies = [
  "anyhow",
+ "env_logger",
+ "log",
  "reqwest",
  "serde",
  "serde_json",
