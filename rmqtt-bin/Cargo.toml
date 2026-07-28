@@ -33,6 +33,7 @@ slog-scope.workspace = true
 slog-term.workspace = true
 slog-async.workspace = true
 anyhow.workspace = true
+serde_json.workspace = true
 chrono = { workspace = true, features = ["clock"] }
 
 ##plugins
@@ -91,4 +92,3 @@ rmqtt-p2p-messaging = { }
 
 [build-dependencies]
 toml.workspace = true
-

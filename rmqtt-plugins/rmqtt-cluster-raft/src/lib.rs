@@ -1,7 +1,7 @@
 #![deny(unsafe_code)]
 
 use std::net::{SocketAddr, ToSocketAddrs};
-use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicIsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -12,7 +12,6 @@ use config::PluginConfig;
 use handler::HookHandler;
 use rust_box::task_exec_queue::TaskExecQueue;
 use serde_json::{self, json};
-use tokio::sync::oneshot;
 use tokio::time::sleep;
 
 use nodes::ClusterNodeManager;
@@ -22,8 +21,7 @@ use rmqtt::{
     macros::Plugin,
     plugin::{PackageInfo, Plugin},
     register,
-    shared::Shared as _,
-    types::{From, Message as SessionMessage, NodeId, Publish, Reason, To},
+    types::{From, NodeId, Publish, Reason, To},
     Result,
 };
 use rmqtt_raft::{Mailbox, Raft};
@@ -51,7 +49,6 @@ struct ClusterPlugin {
     shared: ClusterShared,
     router: ClusterRouter,
     raft_mailbox: Option<Mailbox>,
-    draining: Arc<AtomicBool>,
     drain_message_queue_drops_start: Arc<AtomicIsize>,
     drain_out_inflight_drops_start: Arc<AtomicIsize>,
     exec: TaskExecQueue,
@@ -83,13 +80,11 @@ impl ClusterPlugin {
             cfg.try_lock_timeout,
             cfg.compression,
         );
-        let draining = Arc::new(AtomicBool::new(false));
         let shared = ClusterShared::new(
             scx.clone(),
             exec.clone(),
             router.clone(),
             nodes.clone(),
-            draining.clone(),
             cfg.message_type,
             cfg.task_exec_queue_max,
             cfg.task_exec_queue_workers,
@@ -107,7 +102,6 @@ impl ClusterPlugin {
             shared,
             router,
             raft_mailbox,
-            draining,
             drain_message_queue_drops_start,
             drain_out_inflight_drops_start,
             exec,
@@ -645,7 +639,7 @@ impl ClusterPlugin {
             "appliedIndex": raft_status.as_ref().map(|status| status.applied_index).unwrap_or_default(),
             "committedIndex": raft_status.as_ref().map(|status| status.committed_index).unwrap_or_default(),
             "lastIndex": raft_status.as_ref().map(|status| status.last_index).unwrap_or_default(),
-            "draining": self.draining.load(Ordering::SeqCst),
+            "draining": self.scx.is_draining(),
             "role": raft_status.as_ref().map(|status| format!("{:?}", status.role)),
             "uncommitteds": raft_status.as_ref().map(|status| status.uncommitteds).unwrap_or_default(),
             "mergerProposals": raft_status.as_ref().map(|status| status.merger_proposals).unwrap_or_default(),
@@ -666,47 +660,13 @@ impl ClusterPlugin {
 
     async fn drain_node(&self, _raft_mailbox: &Mailbox) -> Result<serde_json::Value> {
         let id = self.scx.node.id();
-        let start_disconnects = !self.draining.swap(true, Ordering::SeqCst);
+        let start_disconnects = self.scx.begin_draining();
         let disconnect_requested = self.scx.stats.connections.count();
         if start_disconnects {
             self.drain_message_queue_drops_start
                 .store(self.scx.stats.message_queue_drops.count(), Ordering::SeqCst);
             self.drain_out_inflight_drops_start
                 .store(self.scx.stats.out_inflight_drops.count(), Ordering::SeqCst);
-            let shared = self.shared.clone();
-            let draining = self.draining.clone();
-            tokio::spawn(async move {
-                while draining.load(Ordering::SeqCst) {
-                    let entries = shared.inner().iter().collect::<Vec<_>>();
-                    let mut requested = 0usize;
-                    for entry in entries {
-                        let Some(tx) = entry.tx().filter(|tx| !tx.is_closed()) else {
-                            continue;
-                        };
-                        let client_id = entry.id();
-                        let (ack_tx, ack_rx) = oneshot::channel();
-                        match tx.unbounded_send(SessionMessage::Drain(ack_tx, client_id.clone())) {
-                            Ok(()) => {
-                                requested += 1;
-                                tokio::spawn(async move {
-                                    if tokio::time::timeout(Duration::from_secs(5), ack_rx).await.is_err() {
-                                        log::warn!(
-                                            "drain offline transition acknowledgement timed out for {client_id:?}"
-                                        );
-                                    }
-                                });
-                            }
-                            Err(e) => {
-                                log::warn!("drain failed to request disconnect for {client_id:?}: {e:?}");
-                            }
-                        }
-                    }
-                    if requested > 0 {
-                        log::info!("drain requested reconnect for {requested} local MQTT sessions");
-                    }
-                    sleep(Duration::from_secs(1)).await;
-                }
-            });
         }
         Ok(json!({
             "ok": true,
@@ -724,7 +684,7 @@ impl ClusterPlugin {
         let id = node.id;
         let proposal = message::Message::NodeUp { node }.encode()?;
         raft_mailbox.send_proposal(proposal).await.map_err(anyhow::Error::new)?;
-        self.draining.store(false, Ordering::SeqCst);
+        self.scx.cancel_draining();
         Ok(json!({
             "ok": true,
             "id": id,
@@ -817,7 +777,7 @@ impl ClusterPlugin {
 
         json!({
             "id": id,
-            "draining": self.draining.load(Ordering::SeqCst),
+            "draining": self.scx.is_draining(),
             "safe_to_leave": strict_safe_to_leave,
             "message_safe_to_leave": message_safe_to_leave,
             "strict_safe_to_leave": strict_safe_to_leave,
@@ -875,7 +835,7 @@ impl ClusterPlugin {
 
     async fn leave_cluster(&self, raft_mailbox: &Mailbox) -> Result<serde_json::Value> {
         let id = self.scx.node.id();
-        if self.draining.load(Ordering::SeqCst)
+        if self.scx.is_draining()
             && self
                 .drain_status(raft_mailbox)
                 .await

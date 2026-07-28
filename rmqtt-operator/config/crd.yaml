@@ -35,6 +35,15 @@ spec:
                   type: string
                   enum: [Always, IfNotPresent, Never]
                   default: IfNotPresent
+                managementMode:
+                  type: string
+                  enum:
+                    - Managed
+                    - External
+                  default: Managed
+                rolloutNonce:
+                  type: string
+                  default: ""
                 service:
                   type: object
                   properties:

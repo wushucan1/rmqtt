@@ -5335,6 +5335,7 @@ dependencies = [
  "rmqtt-sys-topic",
  "rmqtt-topic-rewrite",
  "rmqtt-web-hook",
+ "serde_json",
  "slog",
  "slog-async",
  "slog-scope",

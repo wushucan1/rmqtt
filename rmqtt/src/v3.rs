@@ -184,6 +184,13 @@ async fn _handshake(
     //hook, client connect
     let _ = scx.extends.hook_mgr().client_connect(&connect_info).await;
 
+    if scx.is_draining() {
+        return Err((
+            ConnectAckReason::V3(ConnectAckReasonV3::ServiceUnavailable),
+            anyhow!("broker is draining"),
+        ));
+    }
+
     if hdshk_start.elapsed() > listen_cfg.handshake_timeout {
         return Err((
             ConnectAckReason::V3(ConnectAckReasonV3::ServiceUnavailable),

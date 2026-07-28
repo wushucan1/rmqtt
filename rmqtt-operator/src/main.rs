@@ -163,6 +163,12 @@ struct ClusterSpec {
     #[serde(default = "default_image_pull_policy")]
     image_pull_policy: String,
     #[serde(default)]
+    management_mode: ManagementMode,
+    /// Change this value to explicitly retry a rollout that is blocked after
+    /// an automatic drain rollback.
+    #[serde(default)]
+    rollout_nonce: String,
+    #[serde(default)]
     service: ServiceSpec,
     #[serde(default)]
     raft: RaftSpec,
@@ -182,6 +188,8 @@ impl Default for ClusterSpec {
             replicas: default_replicas(),
             image: default_image(),
             image_pull_policy: default_image_pull_policy(),
+            management_mode: ManagementMode::default(),
+            rollout_nonce: String::new(),
             service: ServiceSpec::default(),
             raft: RaftSpec::default(),
             config: ConfigSpec::default(),
@@ -190,6 +198,16 @@ impl Default for ClusterSpec {
             monitoring: MonitoringSpec::default(),
         }
     }
+}
+
+#[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+enum ManagementMode {
+    /// The operator creates and reconciles all RMQTT workload resources.
+    #[default]
+    Managed,
+    /// Helm owns the StatefulSet, Services and configuration. The operator
+    /// owns only Raft membership, drain and Pod replacement.
+    External,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -374,6 +392,8 @@ struct StatefulSet {
     metadata: StatefulSetMetadata,
     #[serde(default)]
     spec: StatefulSetSpec,
+    #[serde(default)]
+    status: StatefulSetStatus,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -408,6 +428,8 @@ struct StatefulSetSpec {
     replicas: Option<i32>,
     #[serde(default)]
     template: StatefulSetPodTemplateSpec,
+    #[serde(default, rename = "updateStrategy")]
+    update_strategy: StatefulSetUpdateStrategy,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -423,6 +445,12 @@ struct StatefulSetPodSpec {
 }
 
 #[derive(Debug, Deserialize, Default)]
+struct StatefulSetUpdateStrategy {
+    #[serde(default, rename = "type")]
+    kind: String,
+}
+
+#[derive(Debug, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 struct StatefulSetContainerSpec {
     #[serde(default)]
@@ -431,6 +459,15 @@ struct StatefulSetContainerSpec {
     image: String,
     #[serde(default)]
     image_pull_policy: String,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct StatefulSetStatus {
+    #[serde(default)]
+    current_revision: String,
+    #[serde(default)]
+    update_revision: String,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -625,6 +662,8 @@ struct ClusterStatus {
     conf_change: Option<ConfChangeStatus>,
     #[serde(default)]
     operation: Option<OperationStatus>,
+    #[serde(default)]
+    observed_generation: Option<i64>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -661,6 +700,10 @@ struct OperationStatus {
     started_at: Option<String>,
     #[serde(default)]
     retry_count: u32,
+    #[serde(default)]
+    phase: String,
+    #[serde(default)]
+    revision: String,
 }
 
 impl OperationStatus {
@@ -1009,8 +1052,12 @@ async fn reconcile_cluster(kube: &KubeClient, namespace: &str, cluster: RmqttClu
         cluster.spec.replicas
     );
     validate_spec(&cluster.spec)?;
-    ensure_base_config_map_exists(kube, namespace, &cluster).await?;
 
+    if cluster.spec.management_mode == ManagementMode::External {
+        return reconcile_external_cluster(kube, namespace, &cluster).await;
+    }
+
+    ensure_base_config_map_exists(kube, namespace, &cluster).await?;
     apply_broker_service_account(kube, namespace, &cluster).await?;
     apply_config_map(kube, namespace, &cluster).await?;
     apply_services(kube, namespace, &cluster).await?;
@@ -1058,9 +1105,15 @@ async fn reconcile_cluster(kube: &KubeClient, namespace: &str, cluster: RmqttClu
         return Ok(());
     }
 
-    if let Some(conf_change) = cluster.status.as_ref().and_then(|s| {
-        s.conf_change.clone().or_else(|| s.operation.as_ref().map(OperationStatus::to_conf_change))
-    }) {
+    if let Some(operation) = cluster.status.as_ref().and_then(|status| status.operation.clone()) {
+        if operation_is_blocked_for_generation(&cluster, &operation) {
+            return Ok(());
+        }
+        continue_conf_change(kube, namespace, &cluster, current_replicas, operation.to_conf_change()).await?;
+        return Ok(());
+    }
+
+    if let Some(conf_change) = cluster.status.as_ref().and_then(|status| status.conf_change.clone()) {
         continue_conf_change(kube, namespace, &cluster, current_replicas, conf_change).await?;
         return Ok(());
     }
@@ -1256,6 +1309,490 @@ async fn reconcile_cluster(kube: &KubeClient, namespace: &str, cluster: RmqttClu
     )
     .await?;
     Ok(())
+}
+
+fn operation_is_blocked_for_generation(cluster: &RmqttCluster, operation: &OperationStatus) -> bool {
+    operation.phase == "Blocked" && status_is_from_current_generation(cluster)
+}
+
+fn status_is_from_current_generation(cluster: &RmqttCluster) -> bool {
+    cluster.status.as_ref().and_then(|status| status.observed_generation) == cluster.metadata.generation
+}
+
+fn should_resume_blocked_drain(cluster: &RmqttCluster) -> bool {
+    cluster
+        .status
+        .as_ref()
+        .is_some_and(|status| status.phase == "ScaleInBlocked" && status_is_from_current_generation(cluster))
+}
+
+async fn reconcile_external_cluster(
+    kube: &KubeClient,
+    namespace: &str,
+    cluster: &RmqttCluster,
+) -> Result<()> {
+    let name = cluster.metadata.name.as_str();
+    let Some(stateful_set) = get_stateful_set(kube, namespace, name).await? else {
+        patch_status(
+            kube,
+            namespace,
+            name,
+            json!({
+                "phase": "WaitingExternalWorkload",
+                "message": format!("waiting for Helm-owned StatefulSet {name}"),
+                "desiredReplicas": cluster.spec.replicas,
+                "operation": null,
+                "confChange": null,
+                "observedGeneration": cluster.metadata.generation,
+            }),
+        )
+        .await?;
+        return Ok(());
+    };
+
+    let current_replicas = stateful_set.replicas();
+    if stateful_set.spec.update_strategy.kind != "OnDelete" {
+        patch_status(
+            kube,
+            namespace,
+            name,
+            json!({
+                "phase": "ExternalWorkloadBlocked",
+                "message": "external management requires StatefulSet updateStrategy.type=OnDelete",
+                "replicas": current_replicas,
+                "desiredReplicas": cluster.spec.replicas,
+                "currentRevision": stateful_set.status.current_revision,
+                "updateRevision": stateful_set.status.update_revision,
+                "operation": null,
+                "confChange": null,
+                "observedGeneration": cluster.metadata.generation,
+            }),
+        )
+        .await?;
+        return Ok(());
+    }
+    if current_replicas != cluster.spec.replicas {
+        patch_status(
+            kube,
+            namespace,
+            name,
+            json!({
+                "phase": "ExternalWorkloadBlocked",
+                "message": format!(
+                    "Helm-owned StatefulSet has {current_replicas} replicas but RmqttCluster requests {}; update both atomically before retrying",
+                    cluster.spec.replicas
+                ),
+                "replicas": current_replicas,
+                "desiredReplicas": cluster.spec.replicas,
+                "operation": null,
+                "confChange": null,
+                "observedGeneration": cluster.metadata.generation,
+            }),
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let planned_draining_node_id = cluster
+        .status
+        .as_ref()
+        .and_then(|status| status.operation.as_ref())
+        .filter(|operation| operation.kind == "RollingReplace")
+        .map(|operation| operation.node_id);
+    ensure_unready_pods_not_serving(kube, namespace, name, current_replicas, planned_draining_node_id)
+        .await?;
+
+    if let Some(operation) = cluster.status.as_ref().and_then(|status| status.operation.clone()) {
+        if operation_is_blocked_for_generation(cluster, &operation) {
+            return Ok(());
+        }
+        if operation.kind == "RollingReplace" {
+            let revision = if operation.revision.is_empty() {
+                stateful_set.status.update_revision.as_str()
+            } else {
+                operation.revision.as_str()
+            };
+            rollout_external_pod(kube, namespace, cluster, current_replicas, operation.node_id, revision)
+                .await?;
+        } else {
+            continue_conf_change(kube, namespace, cluster, current_replicas, operation.to_conf_change())
+                .await?;
+        }
+        return Ok(());
+    }
+    if let Some(conf_change) = cluster.status.as_ref().and_then(|status| status.conf_change.clone()) {
+        continue_conf_change(kube, namespace, cluster, current_replicas, conf_change).await?;
+        return Ok(());
+    }
+
+    let ready_replicas = ready_pods(kube, namespace, name).await?.len() as i32;
+    let membership = match leader_membership(kube, namespace, cluster, current_replicas).await {
+        Ok(membership) => membership,
+        Err(e) => {
+            patch_status(
+                kube,
+                namespace,
+                name,
+                json!({
+                    "phase": "WaitingRaftLeader",
+                    "message": format!("external rollout is waiting for authoritative raft membership: {e}"),
+                    "replicas": current_replicas,
+                    "readyReplicas": ready_replicas,
+                    "desiredReplicas": cluster.spec.replicas,
+                    "currentRevision": stateful_set.status.current_revision,
+                    "updateRevision": stateful_set.status.update_revision,
+                    "operation": null,
+                    "confChange": null,
+                    "observedGeneration": cluster.metadata.generation,
+                }),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
+    let unexpected_voters =
+        membership.voters.iter().copied().filter(|node_id| *node_id > current_replicas).collect::<Vec<_>>();
+    if !unexpected_voters.is_empty() {
+        patch_status(
+            kube,
+            namespace,
+            name,
+            json!({
+                "phase": "ExternalScaleInBlocked",
+                "message": format!(
+                    "raft still contains voters {unexpected_voters:?} above the Helm-owned replica count {current_replicas}; external mode will not remove already-deleted nodes automatically"
+                ),
+                "replicas": current_replicas,
+                "readyReplicas": ready_replicas,
+                "desiredReplicas": cluster.spec.replicas,
+                "leaderId": membership.leader_id,
+                "raftStatus": membership_status_json(&membership, current_replicas),
+                "operation": null,
+                "confChange": null,
+                "observedGeneration": cluster.metadata.generation,
+            }),
+        )
+        .await?;
+        return Ok(());
+    }
+
+    if let Some(node_id) = node_requiring_membership_repair(&membership, current_replicas) {
+        let conf_change = ConfChangeStatus {
+            kind: "AddLearnerAndPromote".to_string(),
+            node_id,
+            from_replicas: current_replicas,
+            to_replicas: current_replicas,
+            requested_replicas: cluster.spec.replicas,
+        };
+        continue_add_learner_and_promote(kube, namespace, cluster, current_replicas, &conf_change).await?;
+        return Ok(());
+    }
+
+    let raft_ready = membership_ready_for_replicas(&membership, current_replicas);
+    if ready_replicas < current_replicas || !raft_ready {
+        patch_status(
+            kube,
+            namespace,
+            name,
+            json!({
+                "phase": if ready_replicas < current_replicas { "WaitingPodsReady" } else { "WaitingRaftMembers" },
+                "message": "external rollout waits until every current pod and raft member is healthy",
+                "replicas": current_replicas,
+                "readyReplicas": ready_replicas,
+                "desiredReplicas": cluster.spec.replicas,
+                "leaderId": membership.leader_id,
+                "raftStatus": membership_status_json(&membership, current_replicas),
+                "currentRevision": stateful_set.status.current_revision,
+                "updateRevision": stateful_set.status.update_revision,
+                "operation": null,
+                "confChange": null,
+                "observedGeneration": cluster.metadata.generation,
+            }),
+        )
+        .await?;
+        return Ok(());
+    }
+
+    ensure_ready_pods_serving(kube, namespace, name, current_replicas).await?;
+    let pods = cluster_pods(kube, namespace, name).await?;
+    let update_revision = stateful_set.status.update_revision.as_str();
+    if update_revision.is_empty() {
+        patch_status(
+            kube,
+            namespace,
+            name,
+            json!({
+                "phase": "WaitingStatefulSetRevision",
+                "message": "Helm-owned StatefulSet has not published status.updateRevision",
+                "replicas": current_replicas,
+                "readyReplicas": ready_replicas,
+                "desiredReplicas": cluster.spec.replicas,
+                "leaderId": membership.leader_id,
+                "operation": null,
+                "confChange": null,
+                "observedGeneration": cluster.metadata.generation,
+            }),
+        )
+        .await?;
+        return Ok(());
+    }
+
+    if let Some(node_id) = select_outdated_ready_node(name, &pods, update_revision, membership.leader_id) {
+        rollout_external_pod(kube, namespace, cluster, current_replicas, node_id, update_revision).await?;
+        return Ok(());
+    }
+
+    patch_status(
+        kube,
+        namespace,
+        name,
+        json!({
+            "phase": "Running",
+            "message": null,
+            "replicas": current_replicas,
+            "readyReplicas": ready_replicas,
+            "desiredReplicas": cluster.spec.replicas,
+            "leaderId": membership.leader_id,
+            "members": membership.business_peers.clone(),
+            "raftStatus": membership_status_json(&membership, current_replicas),
+            "currentRevision": stateful_set.status.current_revision,
+            "updateRevision": stateful_set.status.update_revision,
+            "rolloutNonce": cluster.spec.rollout_nonce.clone(),
+            "drainingNodeId": null,
+            "operation": null,
+            "confChange": null,
+            "observedGeneration": cluster.metadata.generation,
+        }),
+    )
+    .await?;
+    Ok(())
+}
+
+async fn rollout_external_pod(
+    kube: &KubeClient,
+    namespace: &str,
+    cluster: &RmqttCluster,
+    current_replicas: i32,
+    victim_id: i32,
+    revision: &str,
+) -> Result<()> {
+    let name = cluster.metadata.name.as_str();
+    if !(1..=current_replicas).contains(&victim_id) {
+        bail!("rolling replacement node id {victim_id} is outside 1..={current_replicas}");
+    }
+    let victim_pod = pod_name(name, victim_id);
+    let rollout = ConfChangeStatus {
+        kind: "RollingReplace".to_string(),
+        node_id: victim_id,
+        from_replicas: current_replicas,
+        to_replicas: current_replicas,
+        requested_replicas: cluster.spec.replicas,
+    };
+    let membership = leader_membership(kube, namespace, cluster, current_replicas).await?;
+
+    if !voter_exists(&membership, victim_id) && !member_exists(&membership.business_peers, victim_id) {
+        delete_pod(kube, namespace, &victim_pod).await?;
+        mark_external_replacement_started(kube, namespace, cluster, current_replicas, victim_id, revision)
+            .await?;
+        return Ok(());
+    }
+
+    if !membership_ready_for_replicas(&membership, current_replicas) {
+        patch_status(
+            kube,
+            namespace,
+            name,
+            json!({
+                "phase": "WaitingRaftMembers",
+                "message": format!("waiting for healthy raft membership before replacing node {victim_id}"),
+                "replicas": current_replicas,
+                "desiredReplicas": cluster.spec.replicas,
+                "leaderId": membership.leader_id,
+                "raftStatus": membership_status_json(&membership, current_replicas),
+                "operation": rollout_operation_status_json(&rollout, "WaitingMembership", revision),
+                "confChange": null,
+                "observedGeneration": cluster.metadata.generation,
+            }),
+        )
+        .await?;
+        return Ok(());
+    }
+
+    if membership.leader_id == Some(victim_id) {
+        let transfer_target = membership
+            .voters
+            .iter()
+            .copied()
+            .filter(|id| *id != victim_id)
+            .filter(|id| raft_peer_caught_up(&membership, *id))
+            .min()
+            .ok_or_else(|| anyhow!("no caught-up voter is available for leadership transfer"))?;
+        rmqtt_action_value_with_payload(
+            namespace,
+            cluster,
+            victim_id,
+            json!({"action": "transfer_leader", "id": transfer_target}),
+        )
+        .await?;
+        patch_status(
+            kube,
+            namespace,
+            name,
+            json!({
+                "phase": "TransferringRaftLeader",
+                "message": format!("transferring leadership from node {victim_id} to node {transfer_target} before rolling replacement"),
+                "replicas": current_replicas,
+                "desiredReplicas": cluster.spec.replicas,
+                "drainingNodeId": victim_id,
+                "leaderId": victim_id,
+                "raftStatus": membership_status_json(&membership, current_replicas),
+                "operation": rollout_operation_status_json(&rollout, "TransferringLeader", revision),
+                "confChange": null,
+                "observedGeneration": cluster.metadata.generation,
+            }),
+        )
+        .await?;
+        return Ok(());
+    }
+
+    patch_pod_draining(kube, namespace, &victim_pod).await?;
+    let _ = rmqtt_action_value(namespace, cluster, victim_id, "drain").await?;
+    patch_status(
+        kube,
+        namespace,
+        name,
+        json!({
+            "phase": "RollingUpdate",
+            "message": format!("draining node {victim_id} before replacing pod {victim_pod}"),
+            "replicas": current_replicas,
+            "desiredReplicas": cluster.spec.replicas,
+            "drainingNodeId": victim_id,
+            "leaderId": membership.leader_id,
+            "raftStatus": membership_status_json(&membership, current_replicas),
+            "operation": rollout_operation_status_json(&rollout, "Draining", revision),
+            "confChange": null,
+            "observedGeneration": cluster.metadata.generation,
+        }),
+    )
+    .await?;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(cluster.spec.raft.drain_timeout_seconds);
+    let mut stable_rounds = 0u8;
+    loop {
+        let status = rmqtt_action::<DrainStatus>(namespace, cluster, victim_id, "drain_status").await?;
+        let routing = routing_barrier_status(namespace, cluster, current_replicas, victim_id).await?;
+        let blockers = drain_blockers(&status, &routing);
+        if status.data_loss_detected {
+            let rollback_result = rollback_drain(kube, namespace, cluster, victim_id, &victim_pod).await;
+            let rollback_succeeded = rollback_result.is_ok();
+            let rollback_message = match rollback_result {
+                Ok(()) => "the broker was automatically undrained".to_string(),
+                Err(e) => format!("automatic undrain failed and requires operator attention: {e:#}"),
+            };
+            patch_status(
+                kube,
+                namespace,
+                name,
+                json!({
+                    "phase": "RollingUpdateBlocked",
+                    "message": format!(
+                        "node {victim_id} discarded queue or inflight messages during drain; {rollback_message}; {blockers}; change spec.rolloutNonce to retry"
+                    ),
+                    "replicas": current_replicas,
+                    "desiredReplicas": cluster.spec.replicas,
+                    "drainingNodeId": if rollback_succeeded { Value::Null } else { json!(victim_id) },
+                    "operation": rollout_operation_status_json(&rollout, "Blocked", revision),
+                    "confChange": null,
+                    "observedGeneration": cluster.metadata.generation,
+                }),
+            )
+            .await?;
+            return Ok(());
+        }
+        if status.scale_in_safe_to_leave() && routing_barrier_ready(&routing) {
+            stable_rounds += 1;
+        } else {
+            stable_rounds = 0;
+        }
+        if stable_rounds >= 2 {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            let rollback_result = rollback_drain(kube, namespace, cluster, victim_id, &victim_pod).await;
+            let rollback_succeeded = rollback_result.is_ok();
+            let rollback_message = match rollback_result {
+                Ok(()) => "the broker was automatically undrained".to_string(),
+                Err(e) => format!("automatic undrain failed and requires operator attention: {e:#}"),
+            };
+            patch_status(
+                kube,
+                namespace,
+                name,
+                json!({
+                    "phase": "RollingUpdateBlocked",
+                    "message": format!(
+                        "node {victim_id} drain timed out after {} seconds; {rollback_message}; {}; change spec.rolloutNonce to retry",
+                        cluster.spec.raft.drain_timeout_seconds,
+                        blockers
+                    ),
+                    "replicas": current_replicas,
+                    "desiredReplicas": cluster.spec.replicas,
+                    "drainingNodeId": if rollback_succeeded { Value::Null } else { json!(victim_id) },
+                    "operation": rollout_operation_status_json(&rollout, "Blocked", revision),
+                    "confChange": null,
+                    "observedGeneration": cluster.metadata.generation,
+                }),
+            )
+            .await?;
+            return Ok(());
+        }
+        sleep(Duration::from_secs(5)).await;
+    }
+
+    let leave = rmqtt_action_value(namespace, cluster, victim_id, "leave").await?;
+    if leave.get("ok").and_then(Value::as_bool) != Some(true) {
+        bail!("node {victim_id} leave returned unexpected response: {leave}");
+    }
+    wait_node_removed(kube, namespace, cluster, victim_id, current_replicas).await?;
+    delete_pod(kube, namespace, &victim_pod).await?;
+    mark_external_replacement_started(kube, namespace, cluster, current_replicas, victim_id, revision).await
+}
+
+async fn mark_external_replacement_started(
+    kube: &KubeClient,
+    namespace: &str,
+    cluster: &RmqttCluster,
+    current_replicas: i32,
+    node_id: i32,
+    revision: &str,
+) -> Result<()> {
+    let conf_change = ConfChangeStatus {
+        kind: "AddLearnerAndPromote".to_string(),
+        node_id,
+        from_replicas: current_replicas,
+        to_replicas: current_replicas,
+        requested_replicas: cluster.spec.replicas,
+    };
+    let mut operation = operation_status_json(&conf_change, "WaitingReplacement", "LearnerCatchUp");
+    operation["revision"] = json!(revision);
+    patch_status(
+        kube,
+        namespace,
+        &cluster.metadata.name,
+        json!({
+            "phase": "WaitingReplacement",
+            "message": format!("deleted pod for node {node_id}; waiting for StatefulSet to recreate it at revision {revision}"),
+            "replicas": current_replicas,
+            "readyReplicas": ready_pods(kube, namespace, &cluster.metadata.name).await?.len(),
+            "desiredReplicas": cluster.spec.replicas,
+            "drainingNodeId": null,
+            "operation": operation,
+            "confChange": conf_change_status_json(&conf_change),
+            "observedGeneration": cluster.metadata.generation,
+        }),
+    )
+    .await
 }
 
 async fn finish_controlled_bootstrap(
@@ -1742,7 +2279,9 @@ async fn continue_add_learner_and_promote(
         apply_stateful_set(kube, namespace, cluster, target_replicas, false).await?;
     }
 
-    let ready_replicas = ready_pods(kube, namespace, name).await?.len() as i32;
+    let ready = ready_pods(kube, namespace, name).await?;
+    let ready_replicas = ready.len() as i32;
+    let target_pod_ready = ready.iter().any(|pod| pod.metadata.name == pod_name(name, node_id));
     let membership = match leader_membership(kube, namespace, cluster, target_replicas).await {
         Ok(membership) => membership,
         Err(e) => {
@@ -1828,7 +2367,12 @@ async fn continue_add_learner_and_promote(
     }
 
     let raft_ready = membership_ready_for_replicas(&membership, target_replicas);
-    if !peer_caught_up || !business_member || ready_replicas < target_replicas || !raft_ready {
+    let same_size_repair = conf_change.from_replicas == conf_change.to_replicas;
+    if !peer_caught_up
+        || !business_member
+        || !target_pod_ready
+        || (!same_size_repair && (ready_replicas < target_replicas || !raft_ready))
+    {
         patch_status(
             kube,
             namespace,
@@ -1836,7 +2380,7 @@ async fn continue_add_learner_and_promote(
             json!({
                 "phase": "WaitingPodsReady",
                 "message": format!(
-                    "node {node_id} is a voter; waiting for local state-machine readiness and business NodeUp; caughtUp={peer_caught_up}, businessPeer={business_member}, readyReplicas={ready_replicas}/{target_replicas}"
+                    "node {node_id} is a voter; waiting for local state-machine readiness and business NodeUp; caughtUp={peer_caught_up}, businessPeer={business_member}, targetPodReady={target_pod_ready}, readyReplicas={ready_replicas}/{target_replicas}"
                 ),
                 "replicas": target_replicas,
                 "readyReplicas": ready_replicas,
@@ -1859,9 +2403,17 @@ async fn continue_add_learner_and_promote(
         namespace,
         name,
         json!({
-            "phase": if target_replicas == cluster.spec.replicas { "Running" } else { "ScalingOut" },
-            "message": if target_replicas == cluster.spec.replicas {
+            "phase": if target_replicas == cluster.spec.replicas && raft_ready {
+                "Running"
+            } else if target_replicas == cluster.spec.replicas {
+                "WaitingRaftMembers"
+            } else {
+                "ScalingOut"
+            },
+            "message": if target_replicas == cluster.spec.replicas && raft_ready {
                 Value::Null
+            } else if target_replicas == cluster.spec.replicas {
+                json!(format!("node {node_id} safely promoted and admitted; continuing membership repair"))
             } else {
                 json!(format!("node {node_id} safely promoted and admitted; continuing toward {} replicas", cluster.spec.replicas))
             },
@@ -2284,8 +2836,7 @@ async fn scale_in_one(
         to_replicas: desired,
         requested_replicas: cluster.spec.replicas,
     };
-    let resume_blocked_drain =
-        cluster.status.as_ref().map(|status| status.phase == "ScaleInBlocked").unwrap_or(false);
+    let resume_blocked_drain = should_resume_blocked_drain(cluster);
     if has_matching_scale_in_operation(cluster, &conf_change) {
         match observe_scale_in_state(kube, namespace, cluster, current_replicas, victim_id).await {
             Ok(observation)
@@ -2574,6 +3125,12 @@ async fn scale_in_one(
             last_progress_log = tokio::time::Instant::now();
         }
         if status.data_loss_detected {
+            let rollback_result = rollback_drain(kube, namespace, cluster, victim_id, &victim_pod).await;
+            let rollback_succeeded = rollback_result.is_ok();
+            let rollback_message = match rollback_result {
+                Ok(()) => "the broker was automatically undrained".to_string(),
+                Err(e) => format!("automatic undrain failed and requires operator attention: {e:#}"),
+            };
             patch_status(
                 kube,
                 namespace,
@@ -2581,9 +3138,9 @@ async fn scale_in_one(
                 json!({
                     "phase": "ScaleInBlocked",
                     "message": format!(
-                        "node {victim_id} discarded queue or inflight messages during drain; refusing removal; {blockers}"
+                        "node {victim_id} discarded queue or inflight messages during drain; refusing removal; {rollback_message}; {blockers}"
                     ),
-                    "drainingNodeId": victim_id,
+                    "drainingNodeId": if rollback_succeeded { Value::Null } else { json!(victim_id) },
                     "operation": scale_in_operation_status_json(
                         cluster,
                         &conf_change,
@@ -2628,6 +3185,12 @@ async fn scale_in_one(
             return Ok(());
         }
         if tokio::time::Instant::now() >= deadline {
+            let rollback_result = rollback_drain(kube, namespace, cluster, victim_id, &victim_pod).await;
+            let rollback_succeeded = rollback_result.is_ok();
+            let rollback_message = match rollback_result {
+                Ok(()) => "the broker was automatically undrained".to_string(),
+                Err(e) => format!("automatic undrain failed and requires operator attention: {e:#}"),
+            };
             patch_status(
                 kube,
                 namespace,
@@ -2635,11 +3198,11 @@ async fn scale_in_one(
                 json!({
                     "phase": "ScaleInBlocked",
                     "message": format!(
-                        "node {victim_id} drain timed out after {} seconds; {}",
+                        "node {victim_id} drain timed out after {} seconds; {rollback_message}; {}; change the RmqttCluster spec to retry",
                         cluster.spec.raft.drain_timeout_seconds,
                         blockers
                     ),
-                    "drainingNodeId": victim_id,
+                    "drainingNodeId": if rollback_succeeded { Value::Null } else { json!(victim_id) },
                     "operation": scale_in_operation_status_json(
                         cluster,
                         &conf_change,
@@ -2820,10 +3383,16 @@ async fn ready_pods(kube: &KubeClient, namespace: &str, name: &str) -> Result<Ve
 }
 
 async fn cluster_pods(kube: &KubeClient, namespace: &str, name: &str) -> Result<Vec<Pod>> {
-    let selector = format!("app.kubernetes.io/instance={name}");
-    let path = format!("/api/v1/namespaces/{namespace}/pods?labelSelector={selector}");
-    let pods: PodList = kube.get_json(&path).await?;
-    Ok(pods.items)
+    for selector in [format!("rmqtt.io/cluster={name}"), "app.kubernetes.io/name=rmqtt".to_string()] {
+        let path = format!("/api/v1/namespaces/{namespace}/pods?labelSelector={selector}");
+        let pods: PodList = kube.get_json(&path).await?;
+        let matching =
+            pods.items.into_iter().filter(|pod| pod_node_id(name, pod).is_some()).collect::<Vec<_>>();
+        if !matching.is_empty() {
+            return Ok(matching);
+        }
+    }
+    Ok(Vec::new())
 }
 
 fn pod_is_ready(pod: &Pod) -> bool {
@@ -3393,6 +3962,24 @@ async fn patch_pod_serving(kube: &KubeClient, namespace: &str, pod: &str) -> Res
     kube.merge_patch(&format!("/api/v1/namespaces/{namespace}/pods/{pod}"), &patch).await
 }
 
+async fn rollback_drain(
+    kube: &KubeClient,
+    namespace: &str,
+    cluster: &RmqttCluster,
+    node_id: i32,
+    pod: &str,
+) -> Result<()> {
+    let undrain = rmqtt_action_value(namespace, cluster, node_id, "undrain").await?;
+    if undrain.get("ok").and_then(Value::as_bool) != Some(true) {
+        bail!("node {node_id} undrain returned unexpected response: {undrain}");
+    }
+    patch_pod_serving(kube, namespace, pod).await
+}
+
+async fn delete_pod(kube: &KubeClient, namespace: &str, pod: &str) -> Result<()> {
+    kube.delete(&format!("/api/v1/namespaces/{namespace}/pods/{pod}")).await
+}
+
 async fn ensure_ready_pods_serving(
     kube: &KubeClient,
     namespace: &str,
@@ -3568,6 +4155,29 @@ fn pod_name(cluster_name: &str, node_id: i32) -> String {
     format!("{}-{}", cluster_name, node_id - 1)
 }
 
+fn pod_node_id(cluster_name: &str, pod: &Pod) -> Option<i32> {
+    pod.metadata
+        .name
+        .strip_prefix(&format!("{cluster_name}-"))
+        .and_then(|ordinal| ordinal.parse::<i32>().ok())
+        .map(|ordinal| ordinal + 1)
+}
+
+fn select_outdated_ready_node(
+    cluster_name: &str,
+    pods: &[Pod],
+    update_revision: &str,
+    leader_id: Option<i32>,
+) -> Option<i32> {
+    let outdated = || {
+        pods.iter().filter(|pod| pod_is_ready(pod)).filter_map(|pod| {
+            let revision = pod.metadata.labels.get("controller-revision-hash")?;
+            (revision != update_revision).then(|| pod_node_id(cluster_name, pod)).flatten()
+        })
+    };
+    outdated().filter(|node_id| Some(*node_id) != leader_id).max().or_else(|| outdated().max())
+}
+
 fn conf_change_status_json(conf_change: &ConfChangeStatus) -> Value {
     json!({
         "type": conf_change.kind,
@@ -3643,6 +4253,12 @@ fn utc_now_rfc3339() -> String {
 
 fn kubernetes_microtime(time: DateTime<Utc>) -> String {
     time.to_rfc3339_opts(SecondsFormat::Micros, true)
+}
+
+fn rollout_operation_status_json(conf_change: &ConfChangeStatus, phase: &str, revision: &str) -> Value {
+    let mut operation = operation_status_json(conf_change, phase, "ExternalOnDelete");
+    operation["revision"] = json!(revision);
+    operation
 }
 
 fn membership_status_json(membership: &MembershipStatus, expected_replicas: i32) -> Value {
@@ -3807,6 +4423,14 @@ impl KubeClient {
             .body(patch.to_string())
             .send()
             .await?;
+        self.expect_success(res, path).await
+    }
+
+    async fn delete(&self, path: &str) -> Result<()> {
+        let res = self.request(Method::DELETE, path).send().await?;
+        if res.status() == StatusCode::NOT_FOUND {
+            return Ok(());
+        }
         self.expect_success(res, path).await
     }
 
@@ -4397,5 +5021,116 @@ mod tests {
         assert_eq!(operation["retryCount"], 3);
         assert_eq!(operation["lastError"], "timeout");
         assert_eq!(operation["phase"], "Retrying");
+    }
+
+    #[test]
+    fn external_rollout_prefers_highest_ready_non_leader_on_old_revision() {
+        let pods: Vec<Pod> = serde_json::from_value(json!([
+            {
+                "metadata": {
+                    "name": "rmqtt-0",
+                    "labels": {"controller-revision-hash": "old"}
+                },
+                "status": {
+                    "phase": "Running",
+                    "conditions": [{"type": "Ready", "status": "True"}]
+                }
+            },
+            {
+                "metadata": {
+                    "name": "rmqtt-1",
+                    "labels": {"controller-revision-hash": "old"}
+                },
+                "status": {
+                    "phase": "Running",
+                    "conditions": [{"type": "Ready", "status": "True"}]
+                }
+            },
+            {
+                "metadata": {
+                    "name": "rmqtt-2",
+                    "labels": {"controller-revision-hash": "new"}
+                },
+                "status": {
+                    "phase": "Running",
+                    "conditions": [{"type": "Ready", "status": "True"}]
+                }
+            }
+        ]))
+        .unwrap();
+
+        assert_eq!(select_outdated_ready_node("rmqtt", &pods, "new", Some(2)), Some(1));
+        assert_eq!(select_outdated_ready_node("rmqtt", &pods, "new", Some(1)), Some(2));
+        assert_eq!(select_outdated_ready_node("rmqtt", &pods, "old", Some(1)), Some(3));
+    }
+
+    #[test]
+    fn management_mode_deserializes_external_camel_case_spec() {
+        let spec: ClusterSpec = serde_json::from_value(json!({
+            "replicas": 3,
+            "managementMode": "External",
+            "rolloutNonce": "retry-1"
+        }))
+        .unwrap();
+
+        assert_eq!(spec.management_mode, ManagementMode::External);
+        assert_eq!(spec.rollout_nonce, "retry-1");
+    }
+
+    #[test]
+    fn stateful_set_deserializes_managed_template_and_external_rollout_fields() {
+        let stateful_set: StatefulSet = serde_json::from_value(json!({
+            "spec": {
+                "replicas": 3,
+                "updateStrategy": {"type": "OnDelete"},
+                "template": {
+                    "spec": {
+                        "containers": [{
+                            "name": "rmqtt",
+                            "image": "rmqtt:test",
+                            "imagePullPolicy": "IfNotPresent"
+                        }]
+                    }
+                }
+            },
+            "status": {
+                "currentRevision": "old",
+                "updateRevision": "new"
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(stateful_set.replicas(), 3);
+        assert_eq!(stateful_set.spec.update_strategy.kind, "OnDelete");
+        assert_eq!(stateful_set.rmqtt_container().unwrap().image, "rmqtt:test");
+        assert_eq!(stateful_set.status.current_revision, "old");
+        assert_eq!(stateful_set.status.update_revision, "new");
+    }
+
+    #[test]
+    fn blocked_operations_wait_for_a_new_generation_before_retrying() {
+        let mut cluster: RmqttCluster = serde_json::from_value(json!({
+            "metadata": {"name": "rmqtt", "generation": 7},
+            "spec": {"replicas": 3},
+            "status": {
+                "phase": "ScaleInBlocked",
+                "observedGeneration": 7
+            }
+        }))
+        .unwrap();
+        let operation = |kind: &str| {
+            serde_json::from_value::<OperationStatus>(json!({
+                "type": kind,
+                "phase": "Blocked"
+            }))
+            .unwrap()
+        };
+
+        assert!(operation_is_blocked_for_generation(&cluster, &operation("RollingReplace")));
+        assert!(operation_is_blocked_for_generation(&cluster, &operation("RemoveVoter")));
+        assert!(should_resume_blocked_drain(&cluster));
+        cluster.metadata.generation = Some(8);
+        assert!(!operation_is_blocked_for_generation(&cluster, &operation("RemoveVoter")));
+        assert!(!should_resume_blocked_drain(&cluster));
     }
 }

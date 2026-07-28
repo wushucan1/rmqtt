@@ -76,7 +76,7 @@ async fn main() -> Result<()> {
     //register plugin
     plugin::registers(&scx, conf.plugins.default_startups.clone()).await.expect("register plugin failed");
 
-    let mut builder = MqttServer::new(scx);
+    let mut builder = MqttServer::new(scx.clone());
 
     //tcp
     for (_, listen_cfg) in Settings::instance().listeners.tcps.iter() {
@@ -124,10 +124,54 @@ async fn main() -> Result<()> {
     });
 
     shutdown_rx.await.expect("Failed to receive the shutdown command");
-    //log::info!("Performing cleanup..."); @TODO ... Hook when exiting
+    graceful_shutdown(&scx).await;
 
     tokio::time::sleep(Duration::from_millis(100)).await;
-    std::process::exit(0);
+    Ok(())
+}
+
+async fn graceful_shutdown(scx: &ServerContext) {
+    let timeout_secs = std::env::var("RMQTT_SHUTDOWN_DRAIN_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(25);
+    let timeout = Duration::from_secs(timeout_secs);
+
+    let plugin_name = "rmqtt-cluster-raft";
+    let cluster_drain = scx.plugins.send(plugin_name, serde_json::json!({"action": "drain"})).await;
+    if let Err(e) = cluster_drain {
+        log::warn!(
+            "cluster drain action is unavailable; waiting only for local connections before shutdown: {e}"
+        );
+    }
+    if !scx.is_draining() {
+        scx.begin_draining();
+    }
+
+    log::info!("graceful shutdown started, drain timeout: {timeout:?}");
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let local_idle = scx.connections.count() == 0 && scx.handshake_exec.active_count() == 0;
+        let cluster_safe =
+            match scx.plugins.send(plugin_name, serde_json::json!({"action": "drain_status"})).await {
+                Ok(status) => {
+                    status.get("strict_safe_to_leave").and_then(serde_json::Value::as_bool).unwrap_or(false)
+                }
+                Err(_) => local_idle,
+            };
+
+        if cluster_safe {
+            log::info!("graceful shutdown drain completed");
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            log::warn!(
+                "graceful shutdown drain timed out after {timeout_secs}s; the process must exit because termination cannot be cancelled"
+            );
+            return;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
 }
 
 fn config_builder(cfg: &Listener) -> Builder {

@@ -19,6 +19,13 @@ The operator owns the Kubernetes reconciliation flow for an RMQTT raft cluster:
 - checks both raft voters and business-layer gRPC peers before completing a scale step
 - drains and removes one voter before reducing StatefulSet replicas
 
+The default `managementMode: Managed` keeps this full-ownership behavior. With
+`managementMode: External`, Helm (or another deployment system) owns the
+StatefulSet, Services, configuration, replica count, and pod template. The
+operator only owns traffic admission labels, Raft membership changes, drain,
+and one-at-a-time Pod deletion for an `OnDelete` rolling update. It never
+applies or patches the externally managed StatefulSet.
+
 The broker readiness probe uses `GET /api/v1/health/ready` and only succeeds when the local node has restored a snapshot, applied its local committed index, is a voter, reports raft `started` and `available`, has a current leader, is present in business peers, and is not draining. Deploy the operator together with a broker image containing this endpoint.
 
 New and recreated pods start with `rmqtt.io/serving=false`, so they are excluded from the client Service. The operator queries every reachable raft node, accepts membership only from the node that reports itself as the current leader, and changes the pod to `rmqtt.io/serving=true` only after local readiness and leader-authoritative voter, raft-peer, and business-peer checks all pass. The headless Service continues to publish not-ready addresses so raft discovery does not depend on client traffic admission.
@@ -70,6 +77,11 @@ The RMQTT broker image used by the sample is:
 ```text
 registry.cn-sh-02.sensecore.cn/ccr-ams-public/mirror/docker/rmqtt-test/rmqtt:latest
 ```
+
+The repository root `Dockerfile` packages both `rmqttd` and
+`rmqtt-operator`. A deployment can therefore run the operator from the exact
+same image revision as the brokers by overriding the container command to
+`/app/rmqtt/rmqtt-bin/rmqtt-operator`.
 
 ## Deploy
 
@@ -173,7 +185,32 @@ The operator advances scale-in one node at a time. If `replicas` changes from `5
 
 For each single-step scale-in, the operator verifies the current raft membership is available. It refuses to remove the current leader unless `allowLeaderScaleIn=true`; when enabled, it first transfers leadership to a caught-up voter and confirms the leader changed on a later reconciliation. It then removes the victim from the client Service, asks its clients to reconnect while keeping business routing active, waits for `safe_to_leave=true`, calls `leave`, waits until raft voters and business-layer peers no longer contain the victim, and finally reduces StatefulSet replicas.
 
-`safe_to_leave` requires connections, sessions, handshakes, message queues, inbound/outbound inflights, forwards, message storages, and delayed publishes all to reach zero. A drain timeout blocks the operation; it never forces pod deletion.
+`safe_to_leave` requires connections, sessions, handshakes, message queues, inbound/outbound inflights, forwards, message storages, and delayed publishes all to reach zero. Starting a drain also rejects new MQTT v3/v5 handshakes and snapshots queue/inflight drop counters. If either counter increases, the operator treats the attempt as possible data loss, automatically undrains the broker when possible, and blocks before membership removal or Pod deletion. A drain timeout follows the same rollback rule: it never forces Pod deletion, calls `undrain`, restores the Pod's serving label, and records a blocked operation. Change the `RmqttCluster` spec (use `spec.rolloutNonce` when no functional setting needs to change) to explicitly retry.
+
+## Helm-owned rolling updates
+
+Set the CR to external mode and keep its name and replica count aligned with
+the Helm-owned StatefulSet:
+
+```yaml
+spec:
+  managementMode: External
+  replicas: 3
+  rolloutNonce: ""
+```
+
+The StatefulSet must use `updateStrategy.type: OnDelete`. When Helm changes the
+pod template, Kubernetes publishes a new `status.updateRevision` but does not
+replace Pods. The operator selects one ready Pod on the old revision (preferring
+a non-leader), transfers leadership when necessary, removes it from client
+traffic, drains sessions and routing, leaves Raft, and deletes only that Pod.
+The recreated Pod rejoins as a learner, catches up, is promoted, and is admitted
+to client traffic before the next old-revision Pod is selected.
+
+External mode intentionally does not reconcile replica changes. Helm and the
+CR must be updated together; a mismatch is reported as
+`ExternalWorkloadBlocked` instead of letting two controllers race over the
+StatefulSet.
 
 ## Failure Boundary
 

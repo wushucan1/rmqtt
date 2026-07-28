@@ -56,10 +56,13 @@
 use std::fmt;
 use std::iter::Sum;
 use std::ops::Deref;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use rust_box::task_exec_queue::{Builder, TaskExecQueue};
 use serde::{Deserialize, Serialize};
+use tokio::sync::oneshot;
 
 use crate::args::CommandArgs;
 #[cfg(feature = "delayed")]
@@ -77,7 +80,7 @@ use crate::router::DefaultRouter;
 use crate::shared::DefaultShared;
 #[cfg(feature = "stats")]
 use crate::stats::Stats;
-use crate::types::{DashMap, HashMap, ListenerConfig, ListenerId, NodeId};
+use crate::types::{DashMap, HashMap, ListenerConfig, ListenerId, Message, NodeId};
 use crate::utils::Counter;
 
 /// Builder for constructing ServerContext with configurable parameters
@@ -253,6 +256,7 @@ impl ServerContextBuilder {
                 handshakings: Counter::new(),
                 connections: Counter::new(),
                 sessions: Counter::new(),
+                draining: AtomicBool::new(false),
 
                 task_exec_workers: self.task_exec_workers,
                 task_exec_queue_max: self.task_exec_queue_max,
@@ -309,6 +313,8 @@ pub struct ServerContextInner {
     pub connections: Counter,
     /// Active session counter
     pub sessions: Counter,
+    /// Planned broker drain state shared by listeners, protocol handshakes and plugins.
+    draining: AtomicBool,
 
     task_exec_workers: usize,
     task_exec_queue_max: usize,
@@ -377,6 +383,72 @@ impl ServerContext {
         } else {
             false
         }
+    }
+
+    /// Starts a planned broker drain.
+    ///
+    /// The first caller transitions the broker into draining mode and starts a
+    /// local session worker. New MQTT handshakes are rejected immediately,
+    /// while existing network connections are moved into their offline session
+    /// loops so another cluster node can take ownership without clearing
+    /// subscriptions or queued messages.
+    ///
+    /// Returns `true` only for the caller that performed the state transition.
+    #[inline]
+    pub fn begin_draining(&self) -> bool {
+        if self.draining.swap(true, Ordering::SeqCst) {
+            return false;
+        }
+
+        let scx = self.clone();
+        tokio::spawn(async move {
+            while scx.is_draining() {
+                let entries = { scx.extends.shared().await.iter().collect::<Vec<_>>() };
+                let mut requested = 0usize;
+                for entry in entries {
+                    let Some(tx) = entry.tx().filter(|tx| !tx.is_closed()) else {
+                        continue;
+                    };
+                    let client_id = entry.id();
+                    let (ack_tx, ack_rx) = oneshot::channel();
+                    match tx.unbounded_send(Message::Drain(ack_tx, client_id.clone())) {
+                        Ok(()) => {
+                            requested += 1;
+                            tokio::spawn(async move {
+                                if tokio::time::timeout(Duration::from_secs(5), ack_rx).await.is_err() {
+                                    log::warn!(
+                                        "drain offline transition acknowledgement timed out for {client_id:?}"
+                                    );
+                                }
+                            });
+                        }
+                        Err(e) => {
+                            log::warn!("drain failed to request disconnect for {client_id:?}: {e:?}");
+                        }
+                    }
+                }
+                if requested > 0 {
+                    log::info!("drain requested reconnect for {requested} local MQTT sessions");
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            log::info!("broker drain worker stopped");
+        });
+        true
+    }
+
+    /// Cancels a planned drain. Existing clients reconnect normally and new
+    /// MQTT handshakes are admitted again.
+    #[inline]
+    pub fn cancel_draining(&self) -> bool {
+        self.draining.swap(false, Ordering::SeqCst)
+    }
+
+    /// Returns whether the broker is currently refusing new MQTT connections
+    /// for a planned drain.
+    #[inline]
+    pub fn is_draining(&self) -> bool {
+        self.draining.load(Ordering::SeqCst)
     }
 
     #[inline]
@@ -521,5 +593,22 @@ impl Sum for TaskExecStats {
 impl Sum<&'static TaskExecStats> for TaskExecStats {
     fn sum<I: Iterator<Item = &'static TaskExecStats>>(iter: I) -> Self {
         iter.fold(TaskExecStats::default(), |acc, x| acc.add2(x))
+    }
+}
+
+#[cfg(test)]
+mod drain_tests {
+    use super::ServerContext;
+
+    #[tokio::test]
+    async fn planned_drain_is_global_idempotent_and_reversible() {
+        let scx = ServerContext::new().busy_check_enable(false).build().await;
+        assert!(!scx.is_draining());
+        assert!(scx.begin_draining());
+        assert!(scx.is_draining());
+        assert!(!scx.begin_draining());
+        assert!(scx.cancel_draining());
+        assert!(!scx.is_draining());
+        assert!(!scx.cancel_draining());
     }
 }

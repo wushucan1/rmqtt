@@ -1,5 +1,3 @@
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::time::Duration;
 
 use ahash::HashSet;
@@ -298,7 +296,6 @@ pub struct ClusterShared {
     inner: DefaultShared,
     router: ClusterRouter,
     nodes: ClusterNodeManager,
-    draining: Arc<AtomicBool>,
     pub(crate) message_type: MessageType,
     exec_queue_busy_limit: isize,
     exec_queue_workers_busy_limit: isize,
@@ -313,7 +310,6 @@ impl ClusterShared {
         exec: TaskExecQueue,
         router: ClusterRouter,
         nodes: ClusterNodeManager,
-        draining: Arc<AtomicBool>,
         message_type: MessageType,
         exec_queue_max: usize,
         exec_queue_workers: usize,
@@ -328,7 +324,6 @@ impl ClusterShared {
             inner: DefaultShared::new(Some(scx1)),
             router,
             nodes,
-            draining,
             message_type,
             exec_queue_busy_limit: (exec_queue_max as f64 * 0.7) as isize,
             exec_queue_workers_busy_limit: (exec_queue_workers as f64 * 0.9) as isize,
@@ -343,7 +338,7 @@ impl ClusterShared {
 
     #[inline]
     pub(crate) fn is_draining(&self) -> bool {
-        self.draining.load(Ordering::SeqCst)
+        self.scx.is_draining()
     }
 
     #[inline]

@@ -11,6 +11,7 @@ LABEL maintainer="rmqtt <rmqttd@126.com>"
 RUN mkdir -p /app/rmqtt/rmqtt-bin
 RUN mkdir -p /app/rmqtt/rmqtt-plugins
 COPY --from=builder /rmqtt/target/release/rmqttd /app/rmqtt/rmqtt-bin/
+COPY --from=builder /rmqtt/target/release/rmqtt-operator /app/rmqtt/rmqtt-bin/
 COPY rmqtt.toml /app/rmqtt/
 COPY rmqtt-plugins/*.toml /app/rmqtt/rmqtt-plugins/
 COPY rmqtt-bin/rmqtt.pem  /app/rmqtt/rmqtt-bin/
@@ -30,4 +31,3 @@ VOLUME ["/var/log/rmqtt"]
 EXPOSE 1883 8883 11883 6060 6003 5363
 
 ENTRYPOINT ["sh", "-c", "/app/rmqtt/rmqtt-bin/rmqttd \"$@\"", "--"]
-
